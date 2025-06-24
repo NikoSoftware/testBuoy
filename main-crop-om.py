@@ -8,8 +8,8 @@ import sys
 # ====================== 配置参数 ======================
 MODEL_PATH = "./runs/train/train/weights/best.om"
 VIDEO_PATH = "./datasets/test/30386095338-1-192.mp4"
-CLASS_NAMES = ["buoy"]  # 根据你的buoy.yaml修改类别名称
-CONF_THRESH = 0.3  # 置信度阈值
+CLASS_NAMES = ["cat","dog"]  # 根据你的buoy.yaml修改类别名称
+CONF_THRESH = 0.6  # 置信度阈值
 NMS_THRESH = 0.65  # NMS阈值
 INPUT_SIZE = (640, 640)  # 模型输入尺寸
 SHOW_WINDOW = True  # 控制是否显示实时检测窗口[2,3](@ref)
