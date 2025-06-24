@@ -6,7 +6,7 @@ import signal
 import sys
 
 # ====================== 配置参数 ======================
-MODEL_PATH = "./runs/train/train6/weights/best.om"
+MODEL_PATH = "./runs/train/train/weights/best.om"
 VIDEO_PATH = "./datasets/test/30386095338-1-192.mp4"
 CLASS_NAMES = ["buoy"]  # 根据你的buoy.yaml修改类别名称
 CONF_THRESH = 0.3  # 置信度阈值
