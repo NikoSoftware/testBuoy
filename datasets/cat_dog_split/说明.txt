@@ -1,0 +1,5 @@
+# val文件夹：
+ 需要像train文件夹一样标注好，用于获取模型性能指标
+ 
+# test文件夹：
+不需要标注，此文件夹用来日常收集各种图片，然后用model.predict(r'D:\work\data_set\cat_vs_dog\cat_dog_split\images\test\test.jpg',conf=0.8,imgsz=320,show=True)查看效果
