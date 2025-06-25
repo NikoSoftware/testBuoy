@@ -26,9 +26,9 @@ def infer_api_static():
     print(outputs[0].shape)
 
     np.set_printoptions(threshold=np.inf)
-    print(outputs1[0])
+    print(outputs[0])
 
-    cv2.imwrite('./img/output.png', outputs1[0])
+    cv2.imwrite('./img/output.png', outputs[0])
 
 
     # free model resource and device context of session
