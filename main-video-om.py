@@ -39,16 +39,19 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     boxes = predictions[:, :4].copy()  # 前4列为边界框
     scores = predictions[:, 4:6].copy()  # 后2列为类别分数[5](@ref)
 
-    # 转换为FP32保证计算精度
-    boxes = boxes.astype(np.float32)
-    scores = scores.astype(np.float32)
-
     # 在NMS前添加
     print("原始类别分数示例 (前5个检测框):")
     for i in range(5):
         cat_score = scores[i, 0]
         dog_score = scores[i, 1]
         print(f"框{i}: cat={cat_score:.3f}, dog={dog_score:.3f}")
+
+
+
+    # 转换为FP32保证计算精度
+    boxes = boxes.astype(np.float32)
+    scores = scores.astype(np.float32)
+
 
     # 边界框格式转换 (cx, cy, w, h) -> (x1, y1, x2, y2)
     x1 = boxes[:, 0] - boxes[:, 2] / 2
