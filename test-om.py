@@ -6,22 +6,22 @@ import signal
 import sys
 import os
 
-# ====================== 精度优化配置 ======================
+# ====================== FP16优化配置 ======================
 MODEL_PATH = "./runs/train/train/weights/best.om"
 VIDEO_PATH = "./datasets/test/30386095338-1-192.mp4"
 CLASS_NAMES = ["cat", "dog"]  # 类别名称
-CONF_THRESH = 0.55  # 降低置信度阈值提高召回率[3](@ref)
+CONF_THRESH = 0.55  # 降低置信度阈值提高召回率
 NMS_THRESH = 0.6  # 调整NMS阈值平衡精度与召回
 INPUT_SIZE = (640, 640)
 SHOW_WINDOW = False
 CALIBRATION_ENABLED = True  # 启用量化校准模式
 CALIBRATION_FILE = "./calibration_data.npy"  # 校准数据保存路径
 CALIBRATION_SAMPLES = 100  # 校准样本数量
-USE_FP32_MODE = True  # 强制使用FP32精度模式[6,9](@ref)
+USE_FP32_MODE = False  # 关键修改：启用FP16模式[6](@ref)
 
-# ====================== 量化校准数据收集 ======================
+# ====================== 量化校准数据收集 (FP16适配版) ======================
 if CALIBRATION_ENABLED and not os.path.exists(CALIBRATION_FILE):
-    print("[精度优化] 正在收集量化校准数据...")
+    print("[FP16优化] 正在收集量化校准数据...")
     calibration_data = []
     cap_cal = cv2.VideoCapture(0)
     cap_cal.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -38,20 +38,21 @@ if CALIBRATION_ENABLED and not os.path.exists(CALIBRATION_FILE):
         start_x, start_y = (w - 640) // 2, (h - 640) // 2
         frame = frame[start_y:start_y + 640, start_x:start_x + 640]
 
-        # 预处理
+        # FP16适配预处理 - 确保数值范围合理
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
+        img = np.clip(img, 0.0, 1.0)  # 限制数值范围防止FP16溢出
         img = np.transpose(img, (2, 0, 1))
         calibration_data.append(img)
 
     np.save(CALIBRATION_FILE, np.array(calibration_data))
     cap_cal.release()
-    print(f"[精度优化] 已保存 {CALIBRATION_SAMPLES} 个校准样本")
+    print(f"[FP16优化] 已保存 {CALIBRATION_SAMPLES} 个校准样本")
 
 
-# ====================== 预处理优化 ======================
+# ====================== 预处理优化 (FP16适配版) ======================
 def preprocess(frame, calibration=False):
-    """优化版预处理：添加自适应直方图均衡化提升特征可辨性[1](@ref)"""
+    """FP16优化版预处理：确保数值范围适配FP16精度"""
     # 旋转裁剪
     rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     h, w = rotated.shape[:2]
@@ -66,15 +67,17 @@ def preprocess(frame, calibration=False):
     lab = cv2.merge((cl, a, b))
     frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    # 转换颜色空间
+    # 转换颜色空间和归一化
     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # 归一化处理（与训练一致）
     img = img.astype(np.float32) / 255.0
+
+    # FP16适配 - 确保数值范围合理
+    img = np.clip(img, 0.0, 1.0)
 
     # 数据增强校准
     if calibration:
-        img = img * 0.9 + 0.05  # 模拟训练时的随机亮度变化[1](@ref)
+        img = img * 0.9 + 0.05  # 模拟训练时的随机亮度变化
+        img = np.clip(img, 0.0, 1.0)  # 再次限制范围
 
     # 格式转换
     img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
@@ -83,7 +86,7 @@ def preprocess(frame, calibration=False):
     return img
 
 
-# ====================== DIoU-NMS后处理优化[3](@ref) ======================
+# ====================== DIoU-NMS后处理优化 ======================
 def diou_nms(boxes, scores, iou_threshold):
     """DIoU-NMS实现：考虑中心点距离的改进NMS算法"""
     if len(boxes) == 0:
@@ -140,9 +143,13 @@ def diou_nms(boxes, scores, iou_threshold):
     return keep
 
 
-# ====================== 后处理优化 ======================
+# ====================== 后处理优化 (FP16适配版) ======================
 def postprocess(outputs, orig_shape, input_size=(640, 640)):
-    """优化版后处理：采用DIoU-NMS并修复坐标转换[3](@ref)"""
+    """FP16优化版后处理：处理FP16输出并确保数值稳定性"""
+    # 确保输出为FP32处理
+    if outputs[0].dtype == np.float16:
+        outputs = [output.astype(np.float32) for output in outputs]
+
     orig_h, orig_w = orig_shape[:2]
     model_w, model_h = input_size
 
@@ -171,7 +178,7 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     boxes[:, [0, 2]] *= scale_x
     boxes[:, [1, 3]] *= scale_y
 
-    # 应用DIoU-NMS[3](@ref)
+    # 应用DIoU-NMS
     confidences = np.max(scores, axis=1)
     class_ids = np.argmax(scores, axis=1)
 
@@ -212,23 +219,23 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     return detections
 
 
-# ====================== 模型初始化优化 ======================
+# ====================== 模型初始化优化 (FP16适配版) ======================
 def init_model():
-    """模型初始化：启用FP32精度和量化校准[6,9](@ref)"""
+    """模型初始化：适配FP16模式"""
     device_id = 0
-    print(f"[精度优化] 正在初始化模型 (强制FP32模式: {USE_FP32_MODE})")
+    print(f"[FP16优化] 正在初始化模型 (FP16模式: {not USE_FP32_MODE})")
 
     # 量化校准处理
     if CALIBRATION_ENABLED and os.path.exists(CALIBRATION_FILE):
-        print("[精度优化] 应用量化校准数据")
+        print("[FP16优化] 应用量化校准数据")
         calibration_data = np.load(CALIBRATION_FILE)
 
         # 创建校准会话
         cal_session = InferSession(device_id, MODEL_PATH)
 
-        # 运行校准推理
+        # 运行校准推理 (使用FP16模式)
         for data in calibration_data:
-            cal_session.infer([data])
+            cal_session.infer([data], mode=None if USE_FP32_MODE else "fp16")
 
     # 创建正式推理会话
     session = InferSession(device_id, MODEL_PATH)
@@ -236,7 +243,9 @@ def init_model():
     # 打印模型信息
     model_desc = session.get_model_desc()
     print(
-        f"[精度优化] 模型初始化完成 | 输入格式: {model_desc.get('input_format')} | 输入数据类型: {model_desc.get('input_data_type')}")
+        f"[FP16优化] 模型初始化完成 | 输入格式: {model_desc.get('input_format')} | "
+        f"输入数据类型: {model_desc.get('input_data_type')} | "
+        f"推理模式: {'FP32' if USE_FP32_MODE else 'FP16'}")
 
     return session
 
@@ -289,7 +298,7 @@ def main():
         blob = preprocess(frame)
         preprocess_time = time.time() - preprocess_start
 
-        # 2. 推理
+        # 2. 推理 (使用FP16模式)
         inference_start = time.time()
         outputs = session.infer([blob], mode="fp32" if USE_FP32_MODE else None)
         inference_time = time.time() - inference_start
@@ -336,8 +345,8 @@ def main():
             # 显示带FPS的实时结果
             fps_text = f"FPS: {1.0 / frame_time:.2f}"
             cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.imshow('YOLOv11 Detection (精度优化版)', frame)
-            cv2.resizeWindow('YOLOv11 Detection (精度优化版)', 640, 640)
+            cv2.imshow('YOLOv11 Detection (FP16优化版)', frame)
+            cv2.resizeWindow('YOLOv11 Detection (FP16优化版)', 640, 640)
 
             # 检查退出按键
             if cv2.waitKey(1) & 0xFF == ord('q'):
