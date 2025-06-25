@@ -203,11 +203,11 @@ def main():
         total_frame += frame_time
 
         # ====================== 打印时间信息 ======================
-        print(f"\n帧 {frame_count} 时间统计:")
-        print(f"预处理: {preprocess_time * 1000:.2f}ms | "
-              f"推理: {inference_time * 1000:.2f}ms | "
-              f"后处理: {postprocess_time * 1000:.2f}ms | "
-              f"总帧耗时: {frame_time * 1000:.2f}ms")
+        # print(f"\n帧 {frame_count} 时间统计:")
+        # print(f"预处理: {preprocess_time * 1000:.2f}ms | "
+        #       f"推理: {inference_time * 1000:.2f}ms | "
+        #       f"后处理: {postprocess_time * 1000:.2f}ms | "
+        #       f"总帧耗时: {frame_time * 1000:.2f}ms")
 
         # 打印检测结果
         print(f"检测到 {len(detections)} 个目标:")
