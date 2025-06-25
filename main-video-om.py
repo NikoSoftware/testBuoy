@@ -43,6 +43,13 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     boxes = boxes.astype(np.float32)
     scores = scores.astype(np.float32)
 
+    # 在NMS前添加
+    print("原始类别分数示例 (前5个检测框):")
+    for i in range(5):
+        cat_score = scores[i, 0]
+        dog_score = scores[i, 1]
+        print(f"框{i}: cat={cat_score:.3f}, dog={dog_score:.3f}")
+
     # 边界框格式转换 (cx, cy, w, h) -> (x1, y1, x2, y2)
     x1 = boxes[:, 0] - boxes[:, 2] / 2
     y1 = boxes[:, 1] - boxes[:, 3] / 2
@@ -64,12 +71,6 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     confidences = np.max(scores, axis=1)
     class_ids = np.argmax(scores, axis=1)
 
-    # 在NMS前添加
-    print("原始类别分数示例 (前5个检测框):")
-    for i in range(5):
-        cat_score = scores[i, 0]
-        dog_score = scores[i, 1]
-        print(f"框{i}: cat={cat_score:.3f}, dog={dog_score:.3f}")
 
     # NMS处理
     indices = cv2.dnn.NMSBoxes(
