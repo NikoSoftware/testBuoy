@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 from ais_bench.infer.interface import InferSession
-from ais_bench.infer.common.utils import logger_print
 
 
 def infer_api_static():
@@ -30,7 +29,7 @@ def infer_api_static():
     print(outputs1[0])
 
     cv2.imwrite('./img/output.png', outputs1[0])
-    logger_print("outputs: %s" % outputs)
+
 
     # free model resource and device context of session
     session.free_resource()
