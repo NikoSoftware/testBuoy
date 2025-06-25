@@ -21,7 +21,7 @@ def preprocess(frame):
     img = cv2.resize(img, INPUT_SIZE)
 
     # 关键修改：使用FP16替代FP32
-    img = img.astype(np.float16) / 255.0  # FP16加速[3](@ref)
+    img = img.astype(np.float32) / 255.0  # FP16加速[3](@ref)
     img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
     img = np.expand_dims(img, axis=0)  # 添加batch维度
     return img
