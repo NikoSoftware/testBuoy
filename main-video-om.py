@@ -16,11 +16,11 @@ SHOW_WINDOW = False  # 是否显示实时检测窗口
 
 
 def preprocess(frame):
-    """图像预处理（FP16优化）"""
+
     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, INPUT_SIZE)
 
-    # 关键修改：使用FP16替代FP32
+
     img = img.astype(np.float32) / 255.0  # FP16加速[3](@ref)
     img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
     img = np.expand_dims(img, axis=0)  # 添加batch维度
@@ -63,6 +63,13 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     # 关键修改：新的置信度和类别计算
     confidences = np.max(scores, axis=1)
     class_ids = np.argmax(scores, axis=1)
+
+    # 在NMS前添加
+    print("原始类别分数示例 (前5个检测框):")
+    for i in range(5):
+        cat_score = scores[i, 0]
+        dog_score = scores[i, 1]
+        print(f"框{i}: cat={cat_score:.3f}, dog={dog_score:.3f}")
 
     # NMS处理
     indices = cv2.dnn.NMSBoxes(
