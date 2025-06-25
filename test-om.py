@@ -14,7 +14,7 @@ CONF_THRESH = 0.55  # 降低置信度阈值提高召回率
 NMS_THRESH = 0.6  # 调整NMS阈值平衡精度与召回
 INPUT_SIZE = (640, 640)
 SHOW_WINDOW = False
-CALIBRATION_ENABLED = True  # 启用量化校准模式
+CALIBRATION_ENABLED = False  # 启用量化校准模式
 CALIBRATION_FILE = "./calibration_data.npy"  # 校准数据保存路径
 CALIBRATION_SAMPLES = 100  # 校准样本数量
 USE_FP32_MODE = False  # 关键修改：启用FP16模式[6](@ref)
@@ -240,12 +240,6 @@ def init_model():
     # 创建正式推理会话
     session = InferSession(device_id, MODEL_PATH)
 
-    # 打印模型信息
-    model_desc = session.get_model_desc()
-    print(
-        f"[FP16优化] 模型初始化完成 | 输入格式: {model_desc.get('input_format')} | "
-        f"输入数据类型: {model_desc.get('input_data_type')} | "
-        f"推理模式: {'FP32' if USE_FP32_MODE else 'FP16'}")
 
     return session
 
