@@ -18,6 +18,7 @@ SHOW_WINDOW = False  # 控制是否显示实时检测窗口
 def preprocess(frame):
     """图像预处理 - 修复内存连续性问题"""
     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (640, 640))
     img = img.astype(np.float32) / 255.0
     img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
     img = np.expand_dims(img, axis=0)  # 添加batch维度
