@@ -134,6 +134,7 @@ def main():
         # 旋转裁剪为640x640
         # processed_frame = rotate_crop_frame(frame)
         processed_frame = frame
+        print("输入尺寸:", processed_frame.shape)
         orig_h, orig_w = frame.shape[:2]
 
         # 预处理
