@@ -56,7 +56,7 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     boxes[:, [0, 2]] *= scale_x
     boxes[:, [1, 3]] *= scale_y
 
-    # 应用NMS
+    # ============== 关键修改：统一处理NMS返回值 ==============
     indices = cv2.dnn.NMSBoxes(
         bboxes=boxes.tolist(),
         scores=confidences.tolist(),
@@ -64,26 +64,32 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
         nms_threshold=NMS_THRESH
     )
 
-    # 提取有效检测结果
-    detections = []
+    # 处理不同格式的返回值（元组/数组）
     if indices is not None:
-        indices = indices.flatten().astype(int)
-        for idx in indices:
-            class_id = class_ids[idx]
-            confidence = confidences[idx]
-            x1, y1, x2, y2 = boxes[idx]
+        indices_np = np.array(indices)
+        if indices_np.ndim == 2:  # 处理二维数组
+            indices_np = indices_np[:, 0]
+        indices_flat = indices_np.flatten().astype(int)
+    else:
+        indices_flat = np.array([], dtype=int)
+    # ============== 修改结束 ==============
 
-            # 确保坐标在图像范围内
-            x1 = max(0, min(orig_w - 1, x1))
-            y1 = max(0, min(orig_h - 1, y1))
-            x2 = max(0, min(orig_w - 1, x2))
-            y2 = max(0, min(orig_h - 1, y2))
+    detections = []
+    for idx in indices_flat:
+        class_id = class_ids[idx]
+        confidence = confidences[idx]
+        x1, y1, x2, y2 = boxes[idx]
 
-            detections.append({
-                "class": CLASS_NAMES[class_id],
-                "confidence": float(confidence),
-                "box": [int(x1), int(y1), int(x2), int(y2)]
-            })
+        x1 = max(0, min(orig_w - 1, x1))
+        y1 = max(0, min(orig_h - 1, y1))
+        x2 = max(0, min(orig_w - 1, x2))
+        y2 = max(0, min(orig_h - 1, y2))
+
+        detections.append({
+            "class": CLASS_NAMES[class_id],
+            "confidence": float(confidence),
+            "box": [int(x1), int(y1), int(x2), int(y2)]
+        })
 
     return detections
 
