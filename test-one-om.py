@@ -6,7 +6,7 @@ from ais_bench.infer.interface import InferSession
 def infer_api_static():
     device_id = 0
     model_path = "./runs/train/train/weights/best.om"
-    image_path = 'datasets/cat_dog_split/images/train/cat_72.jpg'
+    image_path = './datasets/cat_dog_split/images/train/cat_72.jpg'
 
     # 1. 准备输入数据
     image = cv2.imread(image_path)
