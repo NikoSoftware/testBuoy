@@ -146,6 +146,13 @@ def main():
         # 后处理
         detections = postprocess(outputs, (orig_h, orig_w))
 
+        # 打印检测结果
+        print(f"\n检测到 {len(detections)} 个目标:")
+        for i, det in enumerate(detections):
+            print(f"  目标 {i + 1}: {det['class']} | "
+                  f"置信度: {det['confidence']:.4f} | "
+                  f"位置: [{det['box'][0]}, {det['box'][1]}, {det['box'][2]}, {det['box'][3]}]")
+
         # 绘制检测结果
         for det in detections:
             x1, y1, x2, y2 = det['box']
