@@ -190,7 +190,7 @@ if __name__ == "__main__":
     # 配置路径
     model_path = "./runs/train/train/weights/best.om"
     video_path = "./datasets/video/cat_blibli_7.mp4"
-    output_video = "./output_video.mp4"
+    output_video = "./output_dog.mp4"
 
     # 初始化并运行
     detector = YOLOv11_NPU_Inference(model_path)
