@@ -10,16 +10,18 @@ class YOLOv11_NPU_Inference:
         self.input_shape = (640, 640)  # YOLO标准输入尺寸
         self.output_shape = (1, 6, 8400)  # 指定输出张量形状
 
+        # 添加调试信息[1,3](@ref)
+        print("NPU model loaded successfully. Input shape:", self.input_shape)
+
     def preprocess(self, frame):
-        """图像预处理：缩放到输入尺寸并归一化"""
-        # 保持宽高比的缩放
+        """图像预处理：保持宽高比的缩放和填充"""
         h, w = frame.shape[:2]
         scale = min(self.input_shape[1] / w, self.input_shape[0] / h)
         new_w, new_h = int(w * scale), int(h * scale)
         resized = cv2.resize(frame, (new_w, new_h))
 
-        # 创建填充后的画布
-        canvas = np.full((self.input_shape[0], self.input_shape[1], 3), 114, dtype=np.uint8)
+        # 创建填充后的画布（使用128填充效果更好）[1](@ref)
+        canvas = np.full((self.input_shape[0], self.input_shape[1], 3), 128, dtype=np.uint8)
         top = (self.input_shape[0] - new_h) // 2
         left = (self.input_shape[1] - new_w) // 2
         canvas[top:top + new_h, left:left + new_w] = resized
@@ -28,38 +30,73 @@ class YOLOv11_NPU_Inference:
         canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         blob = canvas.astype(np.float32) / 255.0
         blob = blob.transpose(2, 0, 1)[np.newaxis]  # HWC -> NCHW
+
+        # 添加调试信息
+        print(f"Preprocessed: original({h},{w}) -> scaled({new_h},{new_w})")
         return blob, (left, top, scale), (h, w)
 
-    def postprocess(self, outputs, meta, conf_thres=0.5):
+    def postprocess(self, outputs, meta, conf_thres=0.5, iou_thres=0.45):
         """解析NPU输出：过滤检测结果并映射回原图坐标"""
         left, top, scale = meta["padding"]
         original_h, original_w = meta["original_shape"]
 
-        # 提取预测结果 [1,6,8400] -> [8400,6]
+        # 提取预测结果 [1,6,8400] -> [8400,6][9](@ref)
         predictions = outputs[0].squeeze(0).T
-        detections = []
+
+        # 关键修复：正确解析输出格式[9](@ref)
+        # 6个值分别为: cx, cy, w, h, conf, class_prob
+        boxes = []
+        confidences = []
+        class_ids = []
 
         for pred in predictions:
-            conf = pred[4]
+            cx, cy, w, h, conf, class_prob = pred
+
+            # 跳过低置信度检测[3](@ref)
             if conf < conf_thres:
                 continue
 
-            # 解析边界框 (cxcywh格式)
-            cx, cy, w, h = pred[:4] * 2 - 0.5
+            # 关键修复：坐标转换（去归一化）[1](@ref)
+            cx = cx * self.input_shape[1]
+            cy = cy * self.input_shape[0]
+            w = w * self.input_shape[1]
+            h = h * self.input_shape[0]
+
+            # 计算边界框坐标（从中心点转换为角点）
             x1 = int((cx - w / 2 - left) / scale)
             y1 = int((cy - h / 2 - top) / scale)
             x2 = int((cx + w / 2 - left) / scale)
             y2 = int((cy + h / 2 - top) / scale)
 
-            # 裁剪到图像范围内
+            # 确保坐标在图像范围内
             x1 = max(0, min(x1, original_w))
             y1 = max(0, min(y1, original_h))
             x2 = max(0, min(x2, original_w))
             y2 = max(0, min(y2, original_h))
 
-            # 添加结果 (x1, y1, x2, y2, conf, cls)
-            detections.append([x1, y1, x2, y2, conf, int(pred[5])])
+            # 计算框面积（用于后续过滤）
+            area = (x2 - x1) * (y2 - y1)
+            if area <= 10:  # 忽略过小的检测框[3](@ref)
+                continue
 
+            boxes.append([x1, y1, x2 - x1, y2 - y1])  # 格式转为[x,y,width,height]
+            confidences.append(float(conf))
+            class_ids.append(int(class_prob))
+
+        # 应用NMS过滤重叠框[3](@ref)
+        indices = cv2.dnn.NMSBoxes(
+            boxes, confidences, conf_thres, iou_thres
+        )
+
+        detections = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                x, y, w, h = boxes[i]
+                detections.append([
+                    x, y, x + w, y + h, confidences[i], class_ids[i]
+                ])
+
+        print(f"Detected {len(detections)} objects after NMS")
         return detections
 
     def run_video(self, video_path, output_path="./output_dog.mp4"):
@@ -75,15 +112,25 @@ class YOLOv11_NPU_Inference:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
+        frame_count = 0
+
         # 帧处理循环
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
+            frame_count += 1
+            print(f"\nProcessing frame {frame_count}")
+
             # 预处理 -> NPU推理 -> 后处理
             blob, padding_info, orig_shape = self.preprocess(frame)
             outputs = self.session.infer([blob])  # 同步推理
+
+            # 添加输出调试信息[3](@ref)
+            print(f"NPU output shape: {outputs[0].shape}")
+            print(f"NPU output range: {outputs[0].min():.4f} - {outputs[0].max():.4f}")
+
             dets = self.postprocess(outputs, {
                 "padding": padding_info,
                 "original_shape": orig_shape
@@ -92,16 +139,25 @@ class YOLOv11_NPU_Inference:
             # 绘制检测框并输出
             for x1, y1, x2, y2, conf, cls_id in dets:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"{cls_id}:{conf:.2f}",
+                label = f"{cls_id}:{conf:.2f}"
+                cv2.putText(frame, label,
                             (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
                             0.9, (36, 255, 12), 2)
+                print(f"Detected object: {label} at [{x1},{y1},{x2},{y2}]")
 
             out.write(frame)
+
+            # 每10帧显示一次处理结果
+            if frame_count % 10 == 0:
+                cv2.imshow('Preview', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
         # 释放资源
         cap.release()
         out.release()
         cv2.destroyAllWindows()
+        print(f"Processing complete. Output saved to {output_path}")
 
 
 if __name__ == "__main__":
@@ -110,5 +166,7 @@ if __name__ == "__main__":
     video_path = "./datasets/video/dog.mp4"
 
     # 初始化并运行
+    print("Starting YOLOv11 NPU inference...")
     detector = YOLOv11_NPU_Inference(model_path)
     detector.run_video(video_path)
+    print("Execution completed")
