@@ -147,16 +147,11 @@ class YOLOv11_NPU_Inference:
 
             out.write(frame)
 
-            # 每10帧显示一次处理结果
-            if frame_count % 10 == 0:
-                cv2.imshow('Preview', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+
 
         # 释放资源
         cap.release()
         out.release()
-        cv2.destroyAllWindows()
         print(f"Processing complete. Output saved to {output_path}")
 
 
