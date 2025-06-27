@@ -13,7 +13,7 @@ class YOLOv11_NPU_Inference:
         print(f"[NPU] Model loaded. Input shape: {self.input_shape}")
 
         # 调试日志文件
-        self.debug_log = open("np_debug.log", "w")
+        #self.debug_log = open("np_debug.log", "w")
 
     def __del__(self):
         self.debug_log.close()
