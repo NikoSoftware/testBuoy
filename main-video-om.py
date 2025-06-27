@@ -9,7 +9,7 @@ class YOLOv11_NPU_Inference:
         self.session = InferSession(device_id=0, model_path=model_path)
         self.input_shape = (640, 640)
         self.output_shape = (1, 6, 8400)
-        self.conf_thres = 0  # 初始阈值设为极低值
+        self.conf_thres = 0.25  # 初始阈值设为极低值
         print(f"[NPU] Model loaded. Input shape: {self.input_shape}")
 
         # 调试日志文件
@@ -36,77 +36,58 @@ class YOLOv11_NPU_Inference:
         print(f"[Preprocess] {h}x{w} -> {new_h}x{new_w} | Scale: {scale:.4f}")
         return blob, (left, top, scale), (h, w)
 
-    def postprocess(self, outputs, meta, conf_thres=0.01, iou_thres=0.45):
-        """重构后处理逻辑 - 针对绝对坐标输出"""
+    def postprocess(self, outputs, meta, conf_thres=0.25, iou_thres=0.45):
         left, top, scale = meta["padding"]
         orig_h, orig_w = meta["original_shape"]
 
-        # 保存原始输出用于调试
-        np.save(f"np_output_{time.time()}.npy", outputs)
-
         # 解析输出结构 [1,6,8400] -> [8400,6]
-        # 维度含义: [batch, channels, num_predictions]
-        preds = outputs[0][0].T  # 转置为[8400,6]
+        preds = outputs[0][0].T  # 形状(8400,6)
 
-        boxes, confidences, class_ids = [], [], []
+        boxes = []
+        confidences = []
 
         for i in range(preds.shape[0]):
-            # 关键修复：直接使用绝对坐标 [3,7](@ref)
-            cx, cy, w, h, obj_conf, cls_prob = preds[i]
+            # 方案A：假设输出为[x1,y1,x2,y2,conf,class_id]（绝对坐标）
+            x1, y1, x2, y2, conf, class_id = preds[i]
 
-            # 单类别模型：置信度=目标置信度 [7](@ref)
-            conf = 1 / (1 + np.exp(-obj_conf))  # Sigmoid激活
+            # 方案B：若为[cx,cy,w,h,conf,class_id]（绝对坐标）
+            # cx, cy, w, h, conf, class_id = preds[i]
+            # x1 = cx - w/2
+            # y1 = cy - h/2
+            # x2 = cx + w/2
+            # y2 = cy + h/2
 
+            # 去除低置信度
             if conf < conf_thres:
                 continue
 
-            # 计算边界框坐标（绝对坐标直接使用）
-            x1 = int((cx - w / 2 - left) / scale)
-            y1 = int((cy - h / 2 - top) / scale)
-            x2 = int((cx + w / 2 - left) / scale)
-            y2 = int((cy + h / 2 - top) / scale)
+            # 映射回原图坐标（直接使用绝对坐标）
+            x1 = int((x1 - left) / scale)
+            y1 = int((y1 - top) / scale)
+            x2 = int((x2 - left) / scale)
+            y2 = int((y2 - top) / scale)
 
             # 边界检查
-            x1 = max(0, min(x1, orig_w - 1))
-            y1 = max(0, min(y1, orig_h - 1))
-            x2 = max(0, min(x2, orig_w - 1))
-            y2 = max(0, min(y2, orig_h - 1))
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(orig_w - 1, x2), min(orig_h - 1, y2)
 
-            # 过滤无效框
-            bbox_w, bbox_h = x2 - x1, y2 - y1
-            if bbox_w < 2 or bbox_h < 2:
+            w, h = x2 - x1, y2 - y1
+            if w < 5 or h < 5:  # 过滤微小框
                 continue
 
-            # 存储结果（单类别模型class_id=0）
-            boxes.append([x1, y1, bbox_w, bbox_h])
+            boxes.append([x1, y1, w, h])
             confidences.append(float(conf))
-            class_ids.append(0)
 
-            # 调试日志
-            self.debug_log.write(f"Pred{i}: conf={conf:.4f} box=({x1},{y1},{x2},{y2})\n")
-
-        # NMS过滤 (使用OpenCV 4.x兼容方式) [3](@ref)
+        # NMS过滤
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thres, iou_thres)
         detections = []
-        if confidences:
-            # 转换boxes格式为[x,y,w,h]
-            boxes_np = np.array(boxes)
+        if indices is not None:
+            for i in indices.flatten():
+                x, y, w, h = boxes[i]
+                detections.append([x, y, x + w, y + h, confidences[i], 0])  # class_id固定为0
 
-            # 关键修复：使用正确NMS参数
-            indices = cv2.dnn.NMSBoxes(
-                boxes_np.tolist(),
-                confidences,
-                conf_thres,  # 置信度阈值
-                iou_thres  # NMS阈值
-            )
-
-            if indices is not None:
-                for i in indices.flatten():
-                    x, y, w, h = boxes[i]
-                    detections.append([x, y, x + w, y + h, confidences[i], class_ids[i]])
-
-        print(f"[Postprocess] Candidates: {len(confidences)} → NMS: {len(detections)}")
+        print(f"Valid detections: {len(detections)}")
         return detections
-
     def run_video(self, video_path, output_path="./output_dog.mp4"):
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
