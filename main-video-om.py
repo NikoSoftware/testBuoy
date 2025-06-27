@@ -19,11 +19,20 @@ class YOLOv11_NPU:
         self.model_desc = acl.mdl.create_desc()
         acl.mdl.get_desc(self.model_desc, self.model_id)
 
-        # 分配输入/输出内存
+        # 3. 分配输入/输出内存 (修复后)
         self.input_size = acl.mdl.get_input_size_by_index(self.model_desc, 0)
         self.output_size = acl.mdl.get_output_size_by_index(self.model_desc, 0)
-        self.input_buffer = acl.rt.malloc(self.input_size, acl.mem.malloc_type.DEVICE)[1]
-        self.output_buffer = acl.rt.malloc(self.output_size, acl.mem.malloc_type.DEVICE)[1]
+
+        # 使用整数策略替代枚举属性
+        policy = 0  # ACL_MEM_MALLOC_HUGE_FIRST
+        self.input_buffer, ret = acl.rt.malloc(self.input_size, policy)
+        if ret != 0:
+            raise RuntimeError(f"输入内存分配失败，错误码: {ret}")
+
+        self.output_buffer, ret = acl.rt.malloc(self.output_size, policy)
+        if ret != 0:
+            acl.rt.free(self.input_buffer)  # 释放已分配的内存
+            raise RuntimeError(f"输出内存分配失败，错误码: {ret}")
 
         # 创建推理流
         self.stream, _ = acl.rt.create_stream()
