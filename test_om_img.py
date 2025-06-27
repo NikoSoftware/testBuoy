@@ -8,8 +8,8 @@ import os
 MODEL_PATH = "./runs/train/train/weights/best.om"
 IMAGE_PATH = "./img/test.jpg"  # 替换为您的测试图片路径
 CLASS_NAMES = ["cat", "dog"]  # 类别名称
-CONF_THRESH = 0.6  # 置信度阈值
-NMS_THRESH = 0.65  # NMS阈值
+CONF_THRESH = 0.2  # 置信度阈值
+NMS_THRESH = 0.2  # NMS阈值
 INPUT_SIZE = (640, 640)  # 模型输入尺寸
 SHOW_WINDOW = True  # 是否显示检测窗口
 
