@@ -13,6 +13,13 @@ class YOLOv11_NPU_Inference:
         self.output_shape = (1, 6, 8400)  # 指定输出张量形状
         self.total_inference_time = 0  # 总推理时间统计
         self.total_frames = 0  # 总帧数统计
+        self.class_names = self.load_class_names()  # 加载类别名称
+
+    def load_class_names(self):
+        """加载类别名称（示例）"""
+        return [
+            'cat', 'dog'
+        ]
 
     def preprocess(self, frame):
         """图像预处理：缩放到输入尺寸并归一化"""
@@ -62,12 +69,13 @@ class YOLOv11_NPU_Inference:
             y2 = max(0, min(y2, original_h))
 
             # 添加结果 (x1, y1, x2, y2, conf, cls)
-            detections.append([x1, y1, x2, y2, conf, int(pred[5])])
+            cls_id = int(pred[5])
+            detections.append([x1, y1, x2, y2, conf, cls_id])
 
         return detections
 
-    def run_video(self, video_path, output_path="./output.mp4", show_progress=True):
-        """视频流推理主循环，添加进度和时间统计"""
+    def run_video(self, video_path, output_path="./output_dog.mp4", show_progress=True):
+        """视频流推理主循环，添加时间统计和目标坐标输出"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise IOError(f"Cannot open video {video_path}")
@@ -90,6 +98,7 @@ class YOLOv11_NPU_Inference:
         frame_counter = 0
         processing_times = []
         start_time = time.time()
+        prev_frame_time = time.time()  # 用于计算帧率
 
         # 帧处理循环
         while cap.isOpened():
@@ -109,6 +118,7 @@ class YOLOv11_NPU_Inference:
             inference_start = time.time()
             outputs = self.session.infer([blob])  # 同步推理
             inference_time = time.time() - inference_start
+            self.total_inference_time += inference_time
 
             # 后处理
             postprocess_start = time.time()
@@ -120,30 +130,34 @@ class YOLOv11_NPU_Inference:
 
             # 处理总时间
             total_frame_time = time.time() - frame_start
+            processing_times.append(total_frame_time)
+
+            # 计算实时FPS
+            current_time = time.time()
+            fps = 1.0 / (current_time - prev_frame_time)
+            prev_frame_time = current_time
+
+            # 打印检测结果和坐标
+            if dets:
+                print(f"\n🟢 帧 #{frame_counter} 检测到 {len(dets)} 个目标:")
+                for i, (x1, y1, x2, y2, conf, cls_id) in enumerate(dets):
+                    class_name = self.class_names[cls_id] if cls_id < len(self.class_names) else f"Class_{cls_id}"
+                    print(f"  目标 {i + 1}: {class_name} (置信度: {conf:.2f})")
+                    print(f"      坐标: ({x1}, {y1}) - ({x2}, {y2})")
+                    print(f"      尺寸: {x2 - x1}x{y2 - y1} 像素")
+
+            # 在画面上绘制FPS和目标数量
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, f"Targets: {len(dets)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # 绘制检测框并输出
-            render_start = time.time()
             for x1, y1, x2, y2, conf, cls_id in dets:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(frame, f"{cls_id}:{conf:.2f}",
                             (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
                             0.9, (36, 255, 12), 2)
-            render_time = time.time() - render_start
 
             out.write(frame)
-
-            # 累计性能统计
-            processing_times.append({
-                "preprocess": preprocess_time * 1000,  # 毫秒
-                "inference": inference_time * 1000,
-                "postprocess": postprocess_time * 1000,
-                "render": render_time * 1000,
-                "total": total_frame_time * 1000
-            })
-
-            # 更新总统计
-            self.total_inference_time += inference_time
-            self.total_frames = frame_counter
 
             # 显示处理进度
             if show_progress:
@@ -167,23 +181,21 @@ class YOLOv11_NPU_Inference:
 
         # 各阶段耗时分析
         if processing_times:
-            avg_prep = sum([t['preprocess'] for t in processing_times]) / frame_counter
-            avg_inf = sum([t['inference'] for t in processing_times]) / frame_counter
-            avg_post = sum([t['postprocess'] for t in processing_times]) / frame_counter
-            avg_render = sum([t['render'] for t in processing_times]) / frame_counter
-            avg_total = sum([t['total'] for t in processing_times]) / frame_counter
+            avg_prep = sum([t * 1000 for t in processing_times]) / frame_counter
+            print(f"  - 平均单帧耗时: {avg_prep:.1f}ms")
 
-            print("\n📊 性能分析 (平均值):")
-            print(f"  - 预处理: {avg_prep:.1f}ms ({avg_prep / avg_total * 100:.1f}%)")
-            print(f"  - NPU推理: {avg_inf:.1f}ms ({avg_inf / avg_total * 100:.1f}%)")
-            print(f"  - 后处理: {avg_post:.1f}ms ({avg_post / avg_total * 100:.1f}%)")
-            print(f"  - 渲染: {avg_render:.1f}ms ({avg_render / avg_total * 100:.1f}%)")
-            print(f"  - 单帧总耗时: {avg_total:.1f}ms")
+        # NPU性能统计
+        print(f"\n🔥 NPU利用率统计:")
+        print(f"  - 总推理时间: {self.total_inference_time:.2f}秒")
+        print(f"  - 总处理帧数: {frame_counter}帧")
+        print(f"  - 平均推理速度: {self.total_inference_time / frame_counter * 1000:.1f}ms/帧")
 
         # 释放资源
         cap.release()
         out.release()
         cv2.destroyAllWindows()
+
+        print(f"\n💾 输出视频已保存至: {output_path}")
 
 
 if __name__ == "__main__":
@@ -204,13 +216,4 @@ if __name__ == "__main__":
     finally:
         # 最终状态报告
         total_time = time.time() - start_time
-        print(f"\n🔥 NPU利用率统计:")
-        print(f"  - 总推理时间: {detector.total_inference_time:.2f}秒")
-        print(f"  - 总处理帧数: {detector.total_frames}帧")
-        print(f"  - 平均推理速度: {detector.total_inference_time / detector.total_frames * 1000:.1f}ms/帧")
-
-        if detector.total_frames > 0:
-            fps = detector.total_frames / total_time
-            print(f"  - 端到端FPS: {fps:.1f} (含视频编解码)")
-
-        print(f"\n💾 输出视频已保存至: {output_video}")
+        print(f"\n🕒 程序总运行时间: {total_time:.2f}秒")
