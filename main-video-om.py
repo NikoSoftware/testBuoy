@@ -6,7 +6,7 @@ import time
 
 class YOLOv11_NPU:
     def __init__(self, model_path):
-        # 初始化NPU资源
+        # 1. 初始化NPU资源
         ret = acl.init()
         assert ret == 0, f"ACL初始化失败: {ret}"
 
@@ -17,7 +17,7 @@ class YOLOv11_NPU:
         self.context, ret = acl.rt.create_context(self.device_id)
         assert ret == 0, f"创建上下文失败: {ret}"
 
-        # 加载OM模型
+        # 2. 加载OM模型
         self.model_id, ret = acl.mdl.load_from_file(model_path)
         assert ret == 0, f"模型加载失败: {ret}"
 
@@ -25,18 +25,18 @@ class YOLOv11_NPU:
         ret = acl.mdl.get_desc(self.model_desc, self.model_id)
         assert ret == 0, f"获取模型描述失败: {ret}"
 
-        # 分配输入输出内存（关键修复：使用整数策略）
+        # 3. 分配输入输出内存
         self.input_size = acl.mdl.get_input_size_by_index(self.model_desc, 0)
         self.output_size = acl.mdl.get_output_size_by_index(self.model_desc, 0)
 
-        # 内存分配策略：0 = ACL_MEM_MALLOC_HUGE_FIRST
+        # 内存分配策略：0 = ACL_MEM_MALLOC_HUGE_FIRST [1,2](@ref)
         self.input_buffer, ret = acl.rt.malloc(self.input_size, 0)
         assert ret == 0, f"输入内存分配失败: {ret}"
 
-        self.output_buffer, ret = acl.rt.malloc(self.output_size, 0)  # 输出[1,6,8400]
+        self.output_buffer, ret = acl.rt.malloc(self.output_size, 0)
         assert ret == 0, f"输出内存分配失败: {ret}"
 
-        # 创建推理流
+        # 4. 创建推理流
         self.stream, ret = acl.rt.create_stream()
         assert ret == 0, f"创建流失败: {ret}"
 
@@ -62,9 +62,10 @@ class YOLOv11_NPU:
         self.scale = scale
         self.padding = (pad_x, pad_y)
 
-        # 拷贝到NPU设备内存
+        # 关键修复：使用整数值替代枚举属性
+        # HOST->DEVICE = 0, DEVICE->HOST = 1 [1,2](@ref)
         ret = acl.rt.memcpy(self.input_buffer, 0, img.ctypes.data,
-                            img.nbytes, acl.rt.MEMCPY_HOST_TO_DEVICE)
+                            img.nbytes, 0)  # 0表示HOST_TO_DEVICE
         assert ret == 0, f"数据拷贝失败: {ret}"
         return img.shape[2:]  # 返回(640,640)
 
@@ -84,7 +85,7 @@ class YOLOv11_NPU:
         # 取回输出数据 [1,6,8400]
         host_output = np.zeros((1, 6, 8400), dtype=np.float32)
         ret = acl.rt.memcpy(host_output.ctypes.data, self.output_buffer,
-                            self.output_size, acl.rt.MEMCPY_DEVICE_TO_HOST)
+                            self.output_size, 1)  # 1表示DEVICE_TO_HOST
         assert ret == 0, f"输出拷贝失败: {ret}"
         return host_output
 
@@ -161,10 +162,10 @@ class YOLOv11_NPU:
         pad_x, pad_y = self.padding
 
         # 应用逆变换
-        boxes[:, 0] = (boxes[:, 0] - pad_x) / self.scale  # x1
-        boxes[:, 1] = (boxes[:, 1] - pad_y) / self.scale  # y1
-        boxes[:, 2] = (boxes[:, 2] - pad_x) / self.scale  # x2
-        boxes[:, 3] = (boxes[:, 3] - pad_y) / self.scale  # y2
+        boxes[:, 0] = (boxes[:, 0] - pad_x) / self.scale
+        boxes[:, 1] = (boxes[:, 1] - pad_y) / self.scale
+        boxes[:, 2] = (boxes[:, 2] - pad_x) / self.scale
+        boxes[:, 3] = (boxes[:, 3] - pad_y) / self.scale
 
         # 裁剪到图像边界
         np.clip(boxes[:, 0], 0, w_orig, out=boxes[:, 0])
@@ -203,8 +204,9 @@ if __name__ == "__main__":
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # 创建视频写入器（可选）
+    # 创建视频写入器
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter('output.mp4', fourcc, fps, (frame_width, frame_height))
 
@@ -224,7 +226,7 @@ if __name__ == "__main__":
         infer_engine.preprocess(frame)
 
         # 2. NPU推理
-        output = infer_engine.infer_sync()  # [1,6,8400]
+        output = infer_engine.infer_sync()
 
         # 3. 后处理
         boxes = infer_engine.decode_predictions(output, conf_thres=0.5)
@@ -240,13 +242,17 @@ if __name__ == "__main__":
             cv2.putText(frame, label, (int(x1), int(y1) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 5. 显示帧率
+        # 5. 显示帧率和进度
         elapsed_time = time.time() - start_time
         fps = frame_count / elapsed_time
+        progress = frame_count / total_frames * 100
+
         cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"进度: {progress:.1f}%", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        # 写入输出视频（可选）
+        # 写入输出视频
         out.write(frame)
 
         # 显示结果
