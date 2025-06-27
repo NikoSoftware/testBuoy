@@ -42,27 +42,20 @@ class YOLOv11_NPU_ZeroCopy:
         self.output_size = acl.mdl.get_output_size_by_index(self.model_desc, 0)
         print(f"[初始化] 输入尺寸: {self.input_size}字节, 输出尺寸: {self.output_size}字节")
 
-        # 6. 创建内存池（关键优化）
-        self.mem_pool, ret = acl.rt.mem_pool_create(acl.rt.mem_pool_type.MEM_POOL_HIGH,
-                                                    self.input_size * 10)  # 预分配10倍内存
+        # 6. 分配输入输出内存（兼容性修复）
+        # 使用直接分配替代mem_pool_create（解决ACL库兼容性问题）
+        self.input_buffer, ret = acl.rt.malloc(self.input_size, 0)  # 0=ACL_MEM_MALLOC_HUGE_FIRST
         if ret != 0:
             self._release_resources()
-            raise RuntimeError(f"[错误] 内存池创建失败，错误码: {ret}")
-        print("[初始化] 内存池创建成功")
+            raise RuntimeError(f"[错误] 输入内存分配失败，错误码: {ret}")
 
-        # 7. 分配输入输出内存（零拷贝）
-        self.input_buffer = acl.rt.mem_alloc(self.input_size, self.mem_pool)
-        if not self.input_buffer:
+        self.output_buffer, ret = acl.rt.malloc(self.output_size, 0)
+        if ret != 0:
             self._release_resources()
-            raise RuntimeError("[错误] 输入内存分配失败")
-
-        self.output_buffer = acl.rt.mem_alloc(self.output_size, self.mem_pool)
-        if not self.output_buffer:
-            self._release_resources()
-            raise RuntimeError("[错误] 输出内存分配失败")
+            raise RuntimeError(f"[错误] 输出内存分配失败，错误码: {ret}")
         print(f"[初始化] 内存分配完成 (输入: {hex(self.input_buffer)}, 输出: {hex(self.output_buffer)})")
 
-        # 8. 创建异步流
+        # 7. 创建异步流
         self.stream, ret = acl.rt.create_stream()
         if ret != 0:
             self._release_resources()
@@ -72,13 +65,12 @@ class YOLOv11_NPU_ZeroCopy:
     def _release_resources(self):
         """统一释放资源"""
         print("[清理] 开始释放NPU资源...")
-        if hasattr(self, 'mem_pool') and self.mem_pool:
-            acl.rt.mem_pool_destroy(self.mem_pool)
-            print("[清理] 内存池已销毁")
         if hasattr(self, 'input_buffer') and self.input_buffer:
             acl.rt.free(self.input_buffer)
+            print("[清理] 输入内存已释放")
         if hasattr(self, 'output_buffer') and self.output_buffer:
             acl.rt.free(self.output_buffer)
+            print("[清理] 输出内存已释放")
         if hasattr(self, 'model_id'):
             acl.mdl.unload(self.model_id)
             print("[清理] 模型已卸载")
@@ -119,12 +111,11 @@ class YOLOv11_NPU_ZeroCopy:
 
         # 5. 零拷贝内存映射
         img_ptr = img.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        ret = acl.rt.memcpy_async(
+        ret = acl.rt.memcpy(
             self.input_buffer, 0,
             ctypes.cast(img_ptr, ctypes.c_void_p),
             img.nbytes,
-            acl.rt.memcpy_kind.MEMCPY_HOST_TO_DEVICE,
-            self.stream
+            acl.rt.memcpy_kind.MEMCPY_HOST_TO_DEVICE
         )
         if ret != 0:
             raise RuntimeError(f"[错误] 内存映射失败，错误码: {ret}")
@@ -148,7 +139,7 @@ class YOLOv11_NPU_ZeroCopy:
         output_dataset = acl.mdl.create_dataset_buffer(self.output_buffer)
 
         # 2. 执行推理
-        ret = acl.mdl.execute_async(self.model_id, [input_dataset], [output_dataset], self.stream)
+        ret = acl.mdl.execute(self.model_id, input_dataset, output_dataset)
         if ret != 0:
             raise RuntimeError(f"[错误] 推理执行失败，错误码: {ret}")
 
@@ -161,13 +152,15 @@ class YOLOv11_NPU_ZeroCopy:
         host_output = np.zeros((1, 6, 8400), dtype=np.float32)
 
         # 5. 零拷贝输出映射
-        ret = acl.rt.memcpy_async(
+        ret = acl.rt.memcpy(
             host_output.ctypes.data, 0,
             self.output_buffer, 0,
             self.output_size,
-            acl.rt.memcpy_kind.MEMCPY_DEVICE_TO_HOST,
-            self.stream
+            acl.rt.memcpy_kind.MEMCPY_DEVICE_TO_HOST
         )
+        if ret != 0:
+            raise RuntimeError(f"[错误] 输出拷贝失败，错误码: {ret}")
+
         acl.rt.synchronize_stream(self.stream)
 
         infer_time = (time.time() - start_time) * 1000
@@ -305,6 +298,10 @@ if __name__ == "__main__":
     model_path = "./runs/train/train/weights/best.om"
     output_video_path = "output_detection.mp4"
 
+    # 初始化关键变量（解决NameError问题）
+    frame_count = 0
+    cap = out = infer_engine = None
+
     try:
         # 初始化NPU推理引擎
         print("\n" + "=" * 50)
@@ -331,7 +328,6 @@ if __name__ == "__main__":
         print(f"[视频处理] 输出文件: {output_video_path}")
 
         # 性能监控
-        frame_count = 0
         start_time = time.time()
         last_log_time = time.time()
 
@@ -408,11 +404,11 @@ if __name__ == "__main__":
         print("\n" + "=" * 50)
         print(" 系统关闭中，释放资源... ")
         print("=" * 50)
-        if 'infer_engine' in locals():
+        if infer_engine is not None:
             infer_engine.release()
-        if 'cap' in locals() and cap.isOpened():
+        if cap is not None and cap.isOpened():
             cap.release()
-        if 'out' in locals():
+        if out is not None:
             out.release()
         cv2.destroyAllWindows()
 
