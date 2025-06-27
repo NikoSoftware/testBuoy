@@ -12,11 +12,6 @@ class YOLOv11_NPU_Inference:
         self.conf_thres = 0.25  # 初始阈值设为极低值
         print(f"[NPU] Model loaded. Input shape: {self.input_shape}")
 
-        # 调试日志文件
-        #self.debug_log = open("np_debug.log", "w")
-
-    def __del__(self):
-        self.debug_log.close()
 
     def preprocess(self, frame):
         """图像预处理：保持宽高比的缩放和填充"""
