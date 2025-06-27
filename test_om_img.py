@@ -11,7 +11,7 @@ CLASS_NAMES = ["cat", "dog"]  # 类别名称
 CONF_THRESH = 0.2  # 置信度阈值
 NMS_THRESH = 0.2  # NMS阈值
 INPUT_SIZE = (640, 640)  # 模型输入尺寸
-SHOW_WINDOW = True  # 是否显示检测窗口
+SHOW_WINDOW = False  # 是否显示检测窗口
 
 
 def preprocess(frame):
