@@ -9,7 +9,7 @@ class YOLOv11_NPU_Inference:
         self.session = InferSession(device_id=0, model_path=model_path)
         self.input_shape = (640, 640)  # YOLO标准输入尺寸
         self.output_shape = (1, 6, 8400)  # 指定输出张量形状
-        self.conf_thres = 0.3
+        self.conf_thres = 0.2
 
         # 添加调试信息[1,3](@ref)
         print("NPU model loaded successfully. Input shape:", self.input_shape)
@@ -36,65 +36,56 @@ class YOLOv11_NPU_Inference:
         print(f"Preprocessed: original({h},{w}) -> scaled({new_h},{new_w})")
         return blob, (left, top, scale), (h, w)
 
-    def postprocess(self, outputs, meta, conf_thres=0.5, iou_thres=0.45):
-        """解析NPU输出：过滤检测结果并映射回原图坐标"""
+    def postprocess(self, outputs, meta, conf_thres=0.25, iou_thres=0.45):  # 降低置信度阈值
         left, top, scale = meta["padding"]
         original_h, original_w = meta["original_shape"]
 
-        # 提取预测结果 [1,6,8400] -> [8400,6][9](@ref)
+        # 提取预测结果 [1,6,8400] -> [8400,6]
         predictions = outputs[0].squeeze(0).T
 
-        # 关键修复：正确解析输出格式[9](@ref)
-        # 6个值分别为: cx, cy, w, h, conf, class_prob
         boxes = []
         confidences = []
         class_ids = []
 
         for pred in predictions:
-            cx, cy, w, h, conf, class_prob = pred
+            cx, cy, w, h, obj_conf, cls_conf = pred  # 6个值含义: cx,cy,w,h,目标置信度,类别概率
 
-            # 跳过低置信度检测[3](@ref)
+            # 合并置信度 = 目标存在概率 * 类别概率
+            conf = obj_conf * cls_conf
+
+            # 跳过低置信度检测 (阈值从0.5→0.25)
             if conf < conf_thres:
                 continue
 
-            # 关键修复：坐标转换（去归一化）[1](@ref)
-            cx = cx * self.input_shape[1]
-            cy = cy * self.input_shape[0]
-            w = w * self.input_shape[1]
-            h = h * self.input_shape[0]
-
-            # 计算边界框坐标（从中心点转换为角点）
+            # 关键修复1: 直接使用绝对坐标(不再乘640)
             x1 = int((cx - w / 2 - left) / scale)
             y1 = int((cy - h / 2 - top) / scale)
             x2 = int((cx + w / 2 - left) / scale)
             y2 = int((cy + h / 2 - top) / scale)
 
-            # 确保坐标在图像范围内
+            # 边界检查
             x1 = max(0, min(x1, original_w))
             y1 = max(0, min(y1, original_h))
             x2 = max(0, min(x2, original_w))
             y2 = max(0, min(y2, original_h))
 
-            # 计算框面积（用于后续过滤）
-            area = (x2 - x1) * (y2 - y1)
-            if area <= 10:  # 忽略过小的检测框[3](@ref)
-                continue
+            # 关键修复2: 处理单类别模型(类别ID固定为0)
+            if (x2 - x1) > 2 and (y2 - y1) > 2:  # 过滤无效框
+                boxes.append([x1, y1, x2 - x1, y2 - y1])
+                confidences.append(float(conf))
+                class_ids.append(0)  # 单类别模型ID=0
 
-            boxes.append([x1, y1, x2 - x1, y2 - y1])  # 格式转为[x,y,width,height]
-            confidences.append(float(conf))
-            class_ids.append(int(class_prob))
-
-        # 应用NMS过滤重叠框[3](@ref)
-        indices = cv2.dnn.NMSBoxes(
-            boxes, confidences, conf_thres, iou_thres
-        )
+        # NMS过滤
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thres, iou_thres)
 
         detections = []
-        if len(indices) > 0:
+        if indices is not None and len(indices) > 0:
             for i in indices.flatten():
                 x, y, w, h = boxes[i]
                 detections.append([
-                    x, y, x + w, y + h, confidences[i], class_ids[i]
+                    x, y, x + w, y + h,
+                    confidences[i],
+                    class_ids[i]
                 ])
 
         print(f"Detected {len(detections)} objects after NMS")
