@@ -186,11 +186,6 @@ class YOLOv11_NPU_Inference:
             # 写入输出帧
             out.write(frame)
 
-            # 实时显示（每帧）
-            display = cv2.resize(frame, (w // 2, h // 2))
-            cv2.imshow('NPU Detection', display)
-            if cv2.waitKey(1) == 27:  # ESC退出
-                break
 
         # 释放资源
         cap.release()
