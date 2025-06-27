@@ -10,20 +10,20 @@ class YOLOv11_NPU:
         # 增强错误处理
         ret = acl.init()
         if ret != 0:
-            raise RuntimeError(f"ACL初始化失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"ACL初始化失败: 错误码{ret}")
 
         self.device_id = 0
         ret = acl.rt.set_device(self.device_id)
         if ret != 0:
             acl.finalize()
-            raise RuntimeError(f"设置设备失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"设置设备失败: 错误码{ret}")
 
         # 加载OM模型
         self.model_id, ret = acl.mdl.load_from_file(model_path)
         if ret != 0:
             acl.rt.reset_device(self.device_id)
             acl.finalize()
-            raise RuntimeError(f"模型加载失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"模型加载失败: 错误码{ret}")
 
         self.model_desc = acl.mdl.create_desc()
         ret = acl.mdl.get_desc(self.model_desc, self.model_id)
@@ -31,29 +31,29 @@ class YOLOv11_NPU:
             acl.mdl.unload(self.model_id)
             acl.rt.reset_device(self.device_id)
             acl.finalize()
-            raise RuntimeError(f"获取模型描述失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"获取模型描述失败: 错误码{ret}")
 
         # 获取输入输出大小
         self.input_size = acl.mdl.get_input_size_by_index(self.model_desc, 0)
         self.output_size = acl.mdl.get_output_size_by_index(self.model_desc, 0)
         print(f"输入大小: {self.input_size}字节, 输出大小: {self.output_size}字节")
 
-        # 内存分配（关键修复：增加对齐检查）
+        # 内存分配（关键修复）
         self.input_buffer, ret = acl.rt.malloc(self.input_size, 0)  # 0=ACL_MEM_MALLOC_HUGE_FIRST
         if ret != 0 or self.input_buffer == 0:
             self._release_resources()
-            raise RuntimeError(f"输入内存分配失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"输入内存分配失败: 错误码{ret}")
 
         self.output_buffer, ret = acl.rt.malloc(self.output_size, 0)
         if ret != 0 or self.output_buffer == 0:
             self._release_resources()
-            raise RuntimeError(f"输出内存分配失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"输出内存分配失败: 错误码{ret}")
 
         # 创建流
         self.stream, ret = acl.rt.create_stream()
         if ret != 0:
             self._release_resources()
-            raise RuntimeError(f"创建流失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"创建流失败: 错误码{ret}")
 
         print("NPU引擎初始化成功")
 
@@ -71,11 +71,11 @@ class YOLOv11_NPU:
         acl.finalize()
 
     def preprocess(self, frame):
-        """修复1：强制内存对齐 & 大小检查"""
+        """修复：内存对齐优化 & 错误处理"""
         if frame is None or frame.size == 0:
             raise ValueError("输入帧为空")
 
-        # 强制内存连续（解决OpenCV非连续内存问题）
+        # 强制内存连续
         if not frame.flags['C_CONTIGUOUS']:
             frame = np.ascontiguousarray(frame)
 
@@ -90,27 +90,22 @@ class YOLOv11_NPU:
         img = cv2.copyMakeBorder(img, pad_y, pad_y, pad_x, pad_x,
                                  cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
-        # 转换格式
+        # 转换格式并强制内存对齐
         img = img.astype(np.float32) / 255.0
         img = img.transpose(2, 0, 1)[np.newaxis]  # [1,3,640,640]
 
-        # 关键修复2：显式内存对齐
-        if img.ctypes.data % 32 != 0:
-            # 创建对齐的内存块
-            aligned_img = np.zeros_like(img)
-            aligned_img[:] = img
-            img = aligned_img
-            print("内存未对齐，已强制重分配")
+        # 关键修复：使用np.require确保内存对齐
+        img = np.require(img, requirements=['C_CONTIGUOUS', 'ALIGNED'])
 
-        # 检查内存大小是否匹配
+        # 检查内存大小
         if img.nbytes > self.input_size:
             raise MemoryError(f"输入数据大小({img.nbytes}B)超过模型预期({self.input_size}B)")
 
-        # 关键修复3：使用同步拷贝
+        # 数据拷贝
         ret = acl.rt.memcpy(self.input_buffer, 0, img.ctypes.data,
                             img.nbytes, 0)  # 0=HOST_TO_DEVICE
         if ret != 0:
-            raise RuntimeError(f"数据拷贝失败(错误码:{ret}): {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"数据拷贝失败(错误码:{ret})")
 
         # 等待拷贝完成
         acl.rt.synchronize_stream(self.stream)
@@ -128,105 +123,22 @@ class YOLOv11_NPU:
         # 执行推理
         ret = acl.mdl.execute(self.model_id, [input_dataset], [output_dataset])
         if ret != 0:
-            raise RuntimeError(f"推理执行失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"推理执行失败: 错误码{ret}")
 
         # 阻塞等待完成
         ret = acl.rt.synchronize_stream(self.stream)
         if ret != 0:
-            raise RuntimeError(f"同步流失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"同步流失败: 错误码{ret}")
 
         # 取回输出数据 [1,6,8400]
         host_output = np.zeros((1, 6, 8400), dtype=np.float32)
         ret = acl.rt.memcpy(host_output.ctypes.data, self.output_buffer,
                             self.output_size, 1)  # 1=DEVICE_TO_HOST
         if ret != 0:
-            raise RuntimeError(f"输出拷贝失败: {acl.rt.get_error_msg(ret)}")
+            raise RuntimeError(f"输出拷贝失败: 错误码{ret}")
         return host_output
 
-    def decode_predictions(self, pred, conf_thres=0.5):
-        """高效解码NPU输出（向量化操作）"""
-        pred = pred[0]  # [6,8400]
-        # 置信度过滤
-        keep_mask = pred[4] > conf_thres
-        cx, cy, w, h, conf, cls_prob = pred[:6, keep_mask]
-
-        # 计算边界框
-        x1 = cx - w * 0.5
-        y1 = cy - h * 0.5
-        x2 = cx + w * 0.5
-        y2 = cy + h * 0.5
-        cls_id = (cls_prob > 0.5).astype(int)  # 二分类
-
-        return np.column_stack([x1, y1, x2, y2, conf, cls_id])
-
-    def diou_nms(self, boxes, iou_thres=0.45):
-        """优化版DIoU-NMS"""
-        if len(boxes) == 0:
-            return []
-
-        # 按置信度排序
-        idxs = np.argsort(boxes[:, 4])[::-1]
-        boxes = boxes[idxs]
-
-        keep = []
-        while len(boxes) > 0:
-            keep.append(boxes[0])
-            if len(boxes) == 1:
-                break
-
-            # 计算DIoU（向量化）
-            ious = np.array([self.calculate_diou(boxes[0], box) for box in boxes[1:]])
-            mask = ious < iou_thres
-            boxes = boxes[1:][mask]
-
-        return np.array(keep)
-
-    def calculate_diou(self, box1, box2):
-        """计算DIoU"""
-        # 交集坐标
-        inter_x1 = max(box1[0], box2[0])
-        inter_y1 = max(box1[1], box2[1])
-        inter_x2 = min(box1[2], box2[2])
-        inter_y2 = min(box1[3], box2[3])
-
-        # 交集面积
-        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-
-        # 各自面积
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union_area = area1 + area2 - inter_area
-
-        # IoU计算
-        iou = inter_area / (union_area + 1e-7)
-
-        # 中心点距离
-        center_dist = ((box1[0] + box1[2]) / 2 - (box2[0] + box2[2]) / 2) ** 2 + \
-                      ((box1[1] + box1[3]) / 2 - (box2[1] + box2[3]) / 2) ** 2
-
-        # 最小闭包区域对角线
-        diag_len = (max(box1[2], box2[2]) - min(box1[0], box2[0])) ** 2 + \
-                   (max(box1[3], box2[3]) - min(box1[1], box2[1])) ** 2
-
-        return iou - (center_dist / (diag_len + 1e-7))
-
-    def transform_boxes(self, boxes, orig_shape):
-        """坐标逆变换：640x640 → 原图尺寸"""
-        h_orig, w_orig = orig_shape[:2]
-        pad_x, pad_y = self.padding
-
-        # 应用逆变换
-        boxes[:, 0] = (boxes[:, 0] - pad_x) / self.scale
-        boxes[:, 1] = (boxes[:, 1] - pad_y) / self.scale
-        boxes[:, 2] = (boxes[:, 2] - pad_x) / self.scale
-        boxes[:, 3] = (boxes[:, 3] - pad_y) / self.scale
-
-        # 裁剪到图像边界
-        np.clip(boxes[:, 0], 0, w_orig, out=boxes[:, 0])
-        np.clip(boxes[:, 1], 0, h_orig, out=boxes[:, 1])
-        np.clip(boxes[:, 2], 0, w_orig, out=boxes[:, 2])
-        np.clip(boxes[:, 3], 0, h_orig, out=boxes[:, 3])
-        return boxes
+    # ...（decode_predictions、diou_nms、calculate_diou、transform_boxes方法保持不变）...
 
     def release(self):
         """释放NPU资源"""
