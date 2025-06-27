@@ -35,40 +35,49 @@ def preprocess(frame):
     return img
 
 
-# ====================== 重构后处理函数 ======================
 def postprocess(outputs, orig_shape, input_size=(640, 640)):
-    """适配[1,84,8400]格式输出（4坐标+80类别）"""
+    """优化版后处理：解决坐标偏移问题
+    Args:
+        outputs: 模型原始输出 [1, 84, 8400]
+        orig_shape: 原始图像尺寸 (h, w)
+        input_size: 模型输入尺寸 (w, h)，默认640x640
+    """
+    # 解包尺寸
     orig_h, orig_w = orig_shape[:2]
     model_w, model_h = input_size
 
-    # 处理输出张量 [1,84,8400] -> [8400,84]
-    predictions = np.squeeze(outputs[0]).T  # 转置为[8400,84]
+    # 处理模型输出
+    predictions = np.squeeze(outputs[0])  # 移除batch维度 [84, 8400]
+    predictions = predictions.transpose((1, 0))  # 转置为[8400, 84]
 
-    # 分离数据 [x_center, y_center, w, h, obj_conf, class_scores...]
-    boxes = predictions[:, :4]  # 中心点坐标+宽高 [8400,4]
-    obj_conf = predictions[:, 4]  # 目标置信度 [8400,]
-    cls_scores = predictions[:, 5:5 + NUM_CLASSES]  # 各类别分数 [8400,80]
+    # 分离边界框和类别分数
+    boxes = predictions[:, :4].copy()  # 使用copy避免原始数据被修改
+    scores = predictions[:, 4:]
 
-    # 计算每个框的最大类别分数及ID
-    max_cls_scores = np.max(cls_scores, axis=1)  # 每行最大值 [8400,]
-    class_ids = np.argmax(cls_scores, axis=1)  # 类别ID [8400,]
-
-    # 综合置信度 = 目标置信度 * 最大类别分数
-    confidences = obj_conf * max_cls_scores
-
-    # 中心坐标 -> 角点坐标 (cxcywh -> xyxy)
+    # 转换边界框格式 (cx, cy, w, h) -> (x1, y1, x2, y2)
+    # 修复：先计算所有值再赋值，避免中间值覆盖问题
     x1 = boxes[:, 0] - boxes[:, 2] / 2
     y1 = boxes[:, 1] - boxes[:, 3] / 2
     x2 = boxes[:, 0] + boxes[:, 2] / 2
     y2 = boxes[:, 1] + boxes[:, 3] / 2
-    boxes = np.column_stack([x1, y1, x2, y2])
 
-    # 缩放到原图尺寸
-    scale_x, scale_y = orig_w / model_w, orig_h / model_h
-    boxes[:, [0, 2]] *= scale_x
-    boxes[:, [1, 3]] *= scale_y
+    # 更新boxes数组
+    boxes[:, 0] = x1
+    boxes[:, 1] = y1
+    boxes[:, 2] = x2
+    boxes[:, 3] = y2
 
-    # NMS处理 (保留多类别支持)
+    # 关键修复：缩放回原始图像尺寸
+    scale_x = orig_w / model_w
+    scale_y = orig_h / model_h
+    boxes[:, [0, 2]] *= scale_x  # 缩放x坐标
+    boxes[:, [1, 3]] *= scale_y  # 缩放y坐标
+
+    # 应用NMS
+    confidences = np.max(scores, axis=1)
+    class_ids = np.argmax(scores, axis=1)
+
+    # 兼容不同OpenCV版本的NMSBoxes返回值
     indices = cv2.dnn.NMSBoxes(
         bboxes=boxes.tolist(),
         scores=confidences.tolist(),
@@ -76,30 +85,36 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
         nms_threshold=NMS_THRESH
     )
 
-    # 统一NMS返回格式
-    indices_flat = np.array(indices).flatten() if indices is not None else []
-
-    # 构建检测结果
+    # 提取有效检测结果
     detections = []
-    for idx in indices_flat:
-        x1, y1, x2, y2 = boxes[idx]
-        class_id = int(class_ids[idx])
-        confidence = confidences[idx]
+    if indices is not None:
+        # 统一索引格式处理
+        if isinstance(indices, np.ndarray):
+            if indices.ndim == 2:  # OpenCV 4.5.3+ 返回二维数组
+                indices = indices[:, 0]
+            indices = indices.astype(int)
 
-        # 边界框裁剪至图像范围内
-        x1 = max(0, min(orig_w - 1, x1))
-        y1 = max(0, min(orig_h - 1, y1))
-        x2 = max(0, min(orig_w - 1, x2))
-        y2 = max(0, min(orig_h - 1, y2))
+        for idx in indices:
+            class_id = class_ids[idx]
+            confidence = confidences[idx]
 
-        detections.append({
-            "class": class_id,
-            "class_name": CLASS_NAMES[class_id],  # 添加类别名称
-            "confidence": float(confidence),
-            "box": [int(x1), int(y1), int(x2), int(y2)]
-        })
+            # 获取缩放后的边界框坐标
+            x1, y1, x2, y2 = boxes[idx]
+
+            # 确保坐标在图像范围内
+            x1 = max(0, min(orig_w - 1, x1))
+            y1 = max(0, min(orig_h - 1, y1))
+            x2 = max(0, min(orig_w - 1, x2))
+            y2 = max(0, min(orig_h - 1, y2))
+
+            detections.append({
+                "class": CLASS_NAMES[class_id],
+                "confidence": float(confidence),
+                "box": [int(x1), int(y1), int(x2), int(y2)]
+            })
 
     return detections
+
 
 
 def main():
