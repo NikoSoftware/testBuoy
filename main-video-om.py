@@ -10,7 +10,7 @@ MODEL_PATH = "./runs/train/train/weights/best.om"
 VIDEO_PATH = "./datasets/video/dog.mp4"
 OUTPUT_PATH = "./output_dog.mp4"  # 输出视频路径
 CLASS_NAMES = ["cat", "dog"]  # 确保与训练时的类别顺序一致
-CONF_THRESH = 0.3  # 置信度阈值
+CONF_THRESH = 0.2  # 置信度阈值
 NMS_THRESH = 0.2  # NMS阈值
 INPUT_SIZE = (640, 640)  # 模型输入尺寸
 SHOW_WINDOW = False  # 控制是否显示实时检测窗口
@@ -29,25 +29,19 @@ def preprocess(frame):
 
 
 def postprocess(outputs, orig_shape, input_size=(640, 640)):
-    """后处理逻辑重构 - 适配模型输出[1,6,8400]格式"""
     orig_h, orig_w = orig_shape[:2]
     model_w, model_h = input_size
 
-    # 处理模型输出 [1,6,8400] -> [8400,6]
-    predictions = np.squeeze(outputs[0])  # 移除batch维度 [6,8400]
+    # 处理输出 [1,6,8400] -> [8400,6]
+    predictions = np.squeeze(outputs[0])  # 移除batch维度
     predictions = predictions.transpose((1, 0))  # 转置为[8400,6]
 
-    # 分离边界框(4) + 目标置信度(1) + 类别分数(1)
-    boxes = predictions[:, :4].copy()  # [x, y, w, h]
-    obj_conf = predictions[:, 4]  # 目标置信度
-    cls_scores = predictions[:, 5]  # 类别分数
+    # 解析输出结构 (6维: cx,cy,w,h,conf,angle)
+    boxes = predictions[:, :4].copy()  # 中心坐标+宽高
+    confidences = predictions[:, 4]  # 置信度(单值)
+    angles = predictions[:, 5]  # 旋转角度(弧度)
 
-    # 计算最终类别置信度 = 目标置信度 * 类别分数
-    confidences = obj_conf * cls_scores
-    # 二分类处理：cls_scores>0.5为dog，否则为cat
-    class_ids = (cls_scores > 0.5).astype(int)
-
-    # 转换边界框格式 (cx, cy, w, h) -> (x1, y1, x2, y2)
+    # 转换边界框格式 (cx,cy,w,h) -> (x1,y1,x2,y2)
     x1 = boxes[:, 0] - boxes[:, 2] / 2
     y1 = boxes[:, 1] - boxes[:, 3] / 2
     x2 = boxes[:, 0] + boxes[:, 2] / 2
@@ -60,41 +54,41 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
     boxes[:, [0, 2]] *= scale_x
     boxes[:, [1, 3]] *= scale_y
 
-    # NMS处理
+    # 应用NMS (注意: 单类别无需计算多类置信度)
     indices = cv2.dnn.NMSBoxes(
         bboxes=boxes.tolist(),
-        scores=confidences.tolist(),
+        scores=confidences.tolist(),  # 直接使用置信度
         score_threshold=CONF_THRESH,
         nms_threshold=NMS_THRESH
     )
 
-    # 处理不同格式的返回值
-    if indices is not None:
-        indices_np = np.array(indices)
-        if indices_np.ndim == 2:  # 处理二维数组
-            indices_np = indices_np[:, 0]
-        indices_flat = indices_np.flatten().astype(int)
-    else:
-        indices_flat = np.array([], dtype=int)
-
+    # 提取有效检测结果
     detections = []
-    for idx in indices_flat:
-        class_id = class_ids[idx]
-        confidence = confidences[idx]
-        x1, y1, x2, y2 = boxes[idx]
+    if indices is not None:
+        # 统一索引格式
+        if isinstance(indices, np.ndarray):
+            indices = indices.flatten().astype(int)
 
-        # 确保坐标在图像范围内
-        x1 = max(0, min(orig_w - 1, x1))
-        y1 = max(0, min(orig_h - 1, y1))
-        x2 = max(0, min(orig_w - 1, x2))
-        y2 = max(0, min(orig_h - 1, y2))
+        for idx in indices:
+            # 角度处理 (标准化到 -90°~90°)
+            angle = angles[idx]
+            if angle > np.pi / 2:
+                angle -= np.pi  # 避免反向检测[7](@ref)
 
-        detections.append({
-            "class": CLASS_NAMES[class_id],
-            "confidence": float(confidence),
-            "box": [int(x1), int(y1), int(x2), int(y2)]
-        })
+            # 单类别检测 (class_id固定为0或按需分配)
+            class_id = 0  # 所有目标视为同一大类
 
+            detections.append({
+                "class": CLASS_NAMES[class_id],  # 输出类别名
+                "confidence": float(confidences[idx]),
+                "box": [
+                    int(max(0, boxes[idx, 0])),
+                    int(max(0, boxes[idx, 1])),
+                    int(min(orig_w - 1, boxes[idx, 2])),
+                    int(min(orig_h - 1, boxes[idx, 3]))
+                ],
+                "angle": np.degrees(angle)  # 弧度转角度
+            })
     return detections
 
 
