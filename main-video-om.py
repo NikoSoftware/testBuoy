@@ -6,7 +6,7 @@ import signal
 import sys
 
 # ====================== 配置参数 ======================
-MODEL_PATH = "./runs/train/train/weights/best.om"
+MODEL_PATH = "./yolov8/yolov8n.om"
 VIDEO_PATH = "./datasets/video/dog.mp4"
 OUTPUT_PATH = "./output_dog.mp4"  # 输出视频路径
 CLASS_NAMES = ["cat", "dog"]  # 确保与训练时的类别顺序一致

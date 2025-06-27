@@ -5,7 +5,7 @@ import time
 import os
 
 # ====================== 配置参数 ======================
-MODEL_PATH = "./runs/train/train/weights/best.om"
+MODEL_PATH = "./yolov8/yolov8n.om"
 IMAGE_PATH = "./img/test.jpg"  # 替换为您的测试图片路径
 CLASS_NAMES = ["cat", "dog"]  # 类别名称
 CONF_THRESH = 0.2  # 置信度阈值
@@ -86,7 +86,7 @@ def postprocess(outputs, orig_shape, input_size=(640, 640)):
         y2 = max(0, min(orig_h - 1, y2))
 
         detections.append({
-            "class": CLASS_NAMES[class_id],
+            "class": class_id,
             "confidence": float(confidence),
             "box": [int(x1), int(y1), int(x2), int(y2)]
         })
