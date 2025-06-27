@@ -9,6 +9,7 @@ class YOLOv11_NPU_Inference:
         self.session = InferSession(device_id=0, model_path=model_path)
         self.input_shape = (640, 640)  # YOLO标准输入尺寸
         self.output_shape = (1, 6, 8400)  # 指定输出张量形状
+        self.conf_thres = 0.3
 
         # 添加调试信息[1,3](@ref)
         print("NPU model loaded successfully. Input shape:", self.input_shape)
@@ -134,7 +135,7 @@ class YOLOv11_NPU_Inference:
             dets = self.postprocess(outputs, {
                 "padding": padding_info,
                 "original_shape": orig_shape
-            })
+            },conf_thres=self.conf_thres)
 
             # 绘制检测框并输出
             for x1, y1, x2, y2, conf, cls_id in dets:
