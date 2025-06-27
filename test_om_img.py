@@ -6,7 +6,7 @@ import os
 
 # ====================== 配置参数 ======================
 MODEL_PATH = "./yolov8/yolov8n.om"
-IMAGE_PATH = "./img/test.jpg"  # 替换为您的测试图片路径
+IMAGE_PATH = "./img/bus.jpg"  # 替换为您的测试图片路径
 CLASS_NAMES = ["cat", "dog"]  # 类别名称
 CONF_THRESH = 0.2  # 置信度阈值
 NMS_THRESH = 0.2  # NMS阈值
