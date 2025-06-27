@@ -2,179 +2,205 @@ import cv2
 import numpy as np
 from ais_bench.infer.interface import InferSession
 import time
+import signal
+import sys
+
+# ====================== 配置参数 ======================
+MODEL_PATH = "./runs/train/train/weights/best.om"
+VIDEO_PATH = "./datasets/video/dog.mp4"
+OUTPUT_PATH = "./output_dog.mp4"  # 输出视频路径
+CLASS_NAMES = ["cat", "dog"]  # 确保与训练时的类别顺序一致
+CONF_THRESH = 0.3  # 置信度阈值
+NMS_THRESH = 0.2  # NMS阈值
+INPUT_SIZE = (640, 640)  # 模型输入尺寸
+SHOW_WINDOW = False  # 控制是否显示实时检测窗口
+FPS = 30  # 输出视频帧率
 
 
-class YOLOv11_NPU_Inference:
-    def __init__(self, model_path):
-        self.session = InferSession(device_id=0, model_path=model_path)
-        self.input_shape = (640, 640)
-        self.output_shape = (1, 6, 8400)
-        self.conf_thres = 0.25  # 初始阈值设为极低值
-        print(f"[NPU] Model loaded. Input shape: {self.input_shape}")
+def preprocess(frame):
+    """图像预处理 - 修复内存连续性问题"""
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, INPUT_SIZE)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+    img = np.expand_dims(img, axis=0)  # 添加batch维度
+    img = np.ascontiguousarray(img)  # 确保内存连续[5](@ref)
+    return img
 
 
-    def preprocess(self, frame):
-        """图像预处理：保持宽高比的缩放和填充"""
-        h, w = frame.shape[:2]
-        scale = min(self.input_shape[1] / w, self.input_shape[0] / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        resized = cv2.resize(frame, (new_w, new_h))
+def postprocess(outputs, orig_shape, input_size=(640, 640)):
+    """后处理逻辑重构 - 适配模型输出[1,6,8400]格式"""
+    orig_h, orig_w = orig_shape[:2]
+    model_w, model_h = input_size
 
-        # 关键修复：使用YOLO标准填充值114 [7](@ref)
-        canvas = np.full((*self.input_shape, 3), 114, dtype=np.uint8)
-        top = (self.input_shape[0] - new_h) // 2
-        left = (self.input_shape[1] - new_w) // 2
-        canvas[top:top + new_h, left:left + new_w] = resized
+    # 处理模型输出 [1,6,8400] -> [8400,6]
+    predictions = np.squeeze(outputs[0])  # 移除batch维度 [6,8400]
+    predictions = predictions.transpose((1, 0))  # 转置为[8400,6]
 
-        blob = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        blob = blob.transpose(2, 0, 1)[np.newaxis]  # HWC->NCHW
-        print(f"[Preprocess] {h}x{w} -> {new_h}x{new_w} | Scale: {scale:.4f}")
-        return blob, (left, top, scale), (h, w)
+    # 分离边界框(4) + 目标置信度(1) + 类别分数(1)
+    boxes = predictions[:, :4].copy()  # [x, y, w, h]
+    obj_conf = predictions[:, 4]  # 目标置信度
+    cls_scores = predictions[:, 5]  # 类别分数
 
-    def postprocess(self, outputs, meta, conf_thres=0.25, iou_thres=0.45):
-        left, top, scale = meta["padding"]
-        orig_h, orig_w = meta["original_shape"]
+    # 计算最终类别置信度 = 目标置信度 * 类别分数
+    confidences = obj_conf * cls_scores
+    # 二分类处理：cls_scores>0.5为dog，否则为cat
+    class_ids = (cls_scores > 0.5).astype(int)
 
-        # 解析输出结构 [1,6,8400] -> [8400,6]
-        preds = outputs[0][0].T  # 形状(8400,6)
+    # 转换边界框格式 (cx, cy, w, h) -> (x1, y1, x2, y2)
+    x1 = boxes[:, 0] - boxes[:, 2] / 2
+    y1 = boxes[:, 1] - boxes[:, 3] / 2
+    x2 = boxes[:, 0] + boxes[:, 2] / 2
+    y2 = boxes[:, 1] + boxes[:, 3] / 2
+    boxes = np.column_stack([x1, y1, x2, y2])
 
-        boxes = []
-        confidences = []
+    # 缩放回原始图像尺寸
+    scale_x = orig_w / model_w
+    scale_y = orig_h / model_h
+    boxes[:, [0, 2]] *= scale_x
+    boxes[:, [1, 3]] *= scale_y
 
-        for i in range(preds.shape[0]):
-            # 方案A：假设输出为[x1,y1,x2,y2,conf,class_id]（绝对坐标）
-            x1, y1, x2, y2, conf, class_id = preds[i]
+    # NMS处理
+    indices = cv2.dnn.NMSBoxes(
+        bboxes=boxes.tolist(),
+        scores=confidences.tolist(),
+        score_threshold=CONF_THRESH,
+        nms_threshold=NMS_THRESH
+    )
 
-            # 方案B：若为[cx,cy,w,h,conf,class_id]（绝对坐标）
-            # cx, cy, w, h, conf, class_id = preds[i]
-            # x1 = cx - w/2
-            # y1 = cy - h/2
-            # x2 = cx + w/2
-            # y2 = cy + h/2
+    # 处理不同格式的返回值
+    if indices is not None:
+        indices_np = np.array(indices)
+        if indices_np.ndim == 2:  # 处理二维数组
+            indices_np = indices_np[:, 0]
+        indices_flat = indices_np.flatten().astype(int)
+    else:
+        indices_flat = np.array([], dtype=int)
 
-            # 去除低置信度
-            if conf < conf_thres:
-                continue
+    detections = []
+    for idx in indices_flat:
+        class_id = class_ids[idx]
+        confidence = confidences[idx]
+        x1, y1, x2, y2 = boxes[idx]
 
-            # 映射回原图坐标（直接使用绝对坐标）
-            x1 = int((x1 - left) / scale)
-            y1 = int((y1 - top) / scale)
-            x2 = int((x2 - left) / scale)
-            y2 = int((y2 - top) / scale)
+        # 确保坐标在图像范围内
+        x1 = max(0, min(orig_w - 1, x1))
+        y1 = max(0, min(orig_h - 1, y1))
+        x2 = max(0, min(orig_w - 1, x2))
+        y2 = max(0, min(orig_h - 1, y2))
 
-            # 边界检查
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(orig_w - 1, x2), min(orig_h - 1, y2)
+        detections.append({
+            "class": CLASS_NAMES[class_id],
+            "confidence": float(confidence),
+            "box": [int(x1), int(y1), int(x2), int(y2)]
+        })
 
-            w, h = x2 - x1, y2 - y1
-            if w < 5 or h < 5:  # 过滤微小框
-                continue
-
-            boxes.append([x1, y1, w, h])
-            confidences.append(float(conf))
-
-        # NMS过滤
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thres, iou_thres)
-        detections = []
-        if indices is not None:
-            for i in indices.flatten():
-                x, y, w, h = boxes[i]
-                detections.append([x, y, x + w, y + h, confidences[i], 0])  # class_id固定为0
-
-        print(f"Valid detections: {len(detections)}")
-        return detections
-    def run_video(self, video_path, output_path="./output_dog.mp4"):
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise IOError(f"Cannot open video {video_path}")
-
-        # 获取视频属性
-        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # 创建视频写入器
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-
-        frame_idx = 0
-        last_detection_time = time.time()
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_idx += 1
-            print(f"\n--- Frame {frame_idx}/{total_frames} ---")
-
-            # 1. 预处理
-            start_time = time.time()
-            blob, padding_info, orig_shape = self.preprocess(frame)
-            preprocess_time = time.time() - start_time
-
-            # 2. NPU推理
-            start_time = time.time()
-            outputs = self.session.infer([blob])
-            infer_time = time.time() - start_time
-
-            # 调试信息
-            print(f"[NPU] Shape: {outputs[0].shape} | Range: {outputs[0].min():.2f}-{outputs[0].max():.2f}")
-            print(f"[Time] Preprocess: {preprocess_time:.4f}s | Inference: {infer_time:.4f}s")
-
-            # 3. 后处理
-            start_time = time.time()
-            dets = self.postprocess(
-                outputs,
-                {"padding": padding_info, "original_shape": orig_shape},
-                conf_thres=self.conf_thres
-            )
-            postprocess_time = time.time() - start_time
-            print(f"[Time] Postprocess: {postprocess_time:.4f}s")
-
-            # 动态调整阈值策略
-            current_time = time.time()
-            if len(dets) == 0:
-                # 超过5秒无检测则降低阈值
-                if current_time - last_detection_time > 5:
-                    self.conf_thres = max(0.001, self.conf_thres * 0.7)
-                    print(f"[Threshold] Adjusting to {self.conf_thres:.4f}")
-            else:
-                last_detection_time = current_time
-
-            # 4. 结果可视化
-            for x1, y1, x2, y2, conf, cls_id in dets:
-                # 绘制边界框
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # 绘制标签
-                label = f"{cls_id}:{conf:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-                print(f"[Detection] {label} at [{x1},{y1},{x2},{y2}]")
-
-            # 显示处理信息
-            info_text = f"FPS: {1 / (preprocess_time + infer_time + postprocess_time):.1f} | Thres: {self.conf_thres:.4f}"
-            cv2.putText(frame, info_text, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-            # 写入输出帧
-            out.write(frame)
+    return detections
 
 
-        # 释放资源
+def main():
+    # 初始化模型
+    session = InferSession(device_id=0, model_path=MODEL_PATH)
+    print(f"已加载模型: {MODEL_PATH}")
+
+    # 打开视频文件
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print(f"错误: 无法打开视频文件 {VIDEO_PATH}")
+        return
+
+    # 获取视频属性
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # 设置输出视频
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps if fps > 0 else FPS,
+                          (frame_width, frame_height))
+    print(f"创建输出视频: {OUTPUT_PATH} ({frame_width}x{frame_height}, FPS: {fps if fps > 0 else FPS})")
+
+    # 注册信号处理器
+    def signal_handler(sig, frame):
+        print("\n释放资源中...")
         cap.release()
         out.release()
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTSTP, signal_handler)
+
+    frame_count = 0
+    start_time = time.time()
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        orig_h, orig_w = frame.shape[:2]
+
+        # 预处理
+        blob = preprocess(frame)
+
+        # NPU推理
+        npu_start = time.time()
+        outputs = session.infer([blob])
+        npu_time = time.time() - npu_start
+
+        # 后处理
+        post_start = time.time()
+        detections = postprocess(outputs, (orig_h, orig_w))
+        post_time = time.time() - post_start
+
+        # 绘制检测结果
+        for det in detections:
+            x1, y1, x2, y2 = det['box']
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame,
+                        f"{det['class']}: {det['confidence']:.2f}",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # 显示处理信息
+        info_text = f"Frame: {frame_count}/{total_frames} | NPU: {npu_time * 1000:.1f}ms | Post: {post_time * 1000:.1f}ms | Objs: {len(detections)}"
+        cv2.putText(frame, info_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # 写入输出视频
+        out.write(frame)
+
+        # 显示实时检测窗口
+        if SHOW_WINDOW:
+            cv2.imshow('YOLOv11 Detection', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        # 进度显示
+        if frame_count % 10 == 0:
+            elapsed = time.time() - start_time
+            avg_fps = frame_count / elapsed
+            print(f"已处理 {frame_count}/{total_frames} 帧, 平均FPS: {avg_fps:.1f}")
+
+    # 计算最终性能
+    total_time = time.time() - start_time
+    avg_fps = frame_count / total_time
+
+    print(f"\n处理完成!")
+    print(f"总帧数: {frame_count}")
+    print(f"总时间: {total_time:.2f}秒")
+    print(f"平均FPS: {avg_fps:.1f}")
+    print(f"输出视频已保存至: {OUTPUT_PATH}")
+
+    # 释放资源
+    cap.release()
+    out.release()
+    if SHOW_WINDOW:
         cv2.destroyAllWindows()
-        print(f"[Output] Saved to {output_path}")
 
 
-if __name__ == "__main__":
-    model_path = "./runs/train/train/weights/best.om"
-    video_path = "./datasets/video/dog.mp4"
-
-    print("Starting YOLOv11 NPU inference...")
-    detector = YOLOv11_NPU_Inference(model_path)
-    detector.run_video(video_path)
-    print("Execution completed")
+if __name__ == '__main__':
+    main()
