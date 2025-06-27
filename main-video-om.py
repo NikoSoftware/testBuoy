@@ -43,7 +43,6 @@ class YOLOv11_NPU_ZeroCopy:
         print(f"[初始化] 输入尺寸: {self.input_size}字节, 输出尺寸: {self.output_size}字节")
 
         # 6. 分配输入输出内存（兼容性修复）
-        # 使用直接分配替代mem_pool_create（解决ACL库兼容性问题）
         self.input_buffer, ret = acl.rt.malloc(self.input_size, 0)  # 0=ACL_MEM_MALLOC_HUGE_FIRST
         if ret != 0:
             self._release_resources()
@@ -109,13 +108,13 @@ class YOLOv11_NPU_ZeroCopy:
             img = np.require(img, requirements=['C_CONTIGUOUS', 'ALIGNED'])
             print("[预处理] 内存对齐调整完成")
 
-        # 5. 零拷贝内存映射
+        # 5. 零拷贝内存映射（关键修复：使用整数代替memcpy_kind枚举）
         img_ptr = img.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         ret = acl.rt.memcpy(
             self.input_buffer, 0,
             ctypes.cast(img_ptr, ctypes.c_void_p),
             img.nbytes,
-            acl.rt.memcpy_kind.MEMCPY_HOST_TO_DEVICE
+            1  # 1 = HOST_TO_DEVICE [1,2](@ref)
         )
         if ret != 0:
             raise RuntimeError(f"[错误] 内存映射失败，错误码: {ret}")
@@ -151,12 +150,12 @@ class YOLOv11_NPU_ZeroCopy:
         # 4. 准备输出缓冲区
         host_output = np.zeros((1, 6, 8400), dtype=np.float32)
 
-        # 5. 零拷贝输出映射
+        # 5. 零拷贝输出映射（关键修复：使用整数代替memcpy_kind枚举）
         ret = acl.rt.memcpy(
             host_output.ctypes.data, 0,
             self.output_buffer, 0,
             self.output_size,
-            acl.rt.memcpy_kind.MEMCPY_DEVICE_TO_HOST
+            2  # 2 = DEVICE_TO_HOST [1,2](@ref)
         )
         if ret != 0:
             raise RuntimeError(f"[错误] 输出拷贝失败，错误码: {ret}")
@@ -298,7 +297,7 @@ if __name__ == "__main__":
     model_path = "./runs/train/train/weights/best.om"
     output_video_path = "output_detection.mp4"
 
-    # 初始化关键变量（解决NameError问题）
+    # 初始化关键变量
     frame_count = 0
     cap = out = infer_engine = None
 
