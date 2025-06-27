@@ -1,177 +1,303 @@
 import cv2
 import numpy as np
-from ais_bench.infer.interface import InferSession
+import acl
 import time
-import signal
-import sys
-
-# ====================== 配置参数 ======================
-MODEL_PATH = "./runs/train/train/weights/best.om"
-VIDEO_PATH = "./datasets/video/cat_blibli_7.mp4"
-CLASS_NAMES = ["cat", "dog"]  # 确保与训练时的类别顺序一致
-CONF_THRESH = 0.6  # 置信度阈值
-NMS_THRESH = 0.65  # NMS阈值
-INPUT_SIZE = (640, 640)  # 模型输入尺寸
-SHOW_WINDOW = False  # 控制是否显示实时检测窗口
+from threading import Thread
+from queue import Queue
 
 
-def preprocess(frame):
-    """图像预处理 - 修复内存连续性问题"""
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (640, 640))
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-    img = np.expand_dims(img, axis=0)  # 添加batch维度
-    img = np.ascontiguousarray(img)  # 关键修复：确保内存连续[1](@ref)
-    return img
+class YOLOv11_NPU:
+    def __init__(self, model_path):
+        # 初始化NPU资源
+        acl.init()
+        self.device_id = 0
+        acl.rt.set_device(self.device_id)
+        self.context, _ = acl.rt.create_context(self.device_id)
+
+        # 加载OM模型
+        self.model_id, _ = acl.mdl.load_from_file(model_path)
+        self.model_desc = acl.mdl.create_desc()
+        acl.mdl.get_desc(self.model_desc, self.model_id)
+
+        # 分配输入/输出内存
+        self.input_size = acl.mdl.get_input_size_by_index(self.model_desc, 0)
+        self.output_size = acl.mdl.get_output_size_by_index(self.model_desc, 0)
+        self.input_buffer = acl.rt.malloc(self.input_size, acl.mem.malloc_type.DEVICE)[1]
+        self.output_buffer = acl.rt.malloc(self.output_size, acl.mem.malloc_type.DEVICE)[1]
+
+        # 创建推理流
+        self.stream, _ = acl.rt.create_stream()
+
+    def preprocess(self, frame):
+        """视频帧预处理 - 优化硬件加速"""
+        # 使用UMat实现零拷贝[6](@ref)
+        if cv2.ocl.haveOpenCL():
+            frame_umat = cv2.UMat(frame)
+            img = cv2.cvtColor(frame_umat, cv2.COLOR_BGR2RGB)
+        else:
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 缩放到640x640（保持宽高比）
+        h, w = img.shape[:2]
+        scale = min(640 / w, 640 / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(img, (new_w, new_h))
+
+        # 填充到640x640
+        pad_x = (640 - new_w) // 2
+        pad_y = (640 - new_h) // 2
+        img = cv2.copyMakeBorder(img, pad_y, pad_y, pad_x, pad_x,
+                                 cv2.BORDER_CONSTANT, value=(114, 114, 114))
+
+        # 转换为NPU输入格式
+        img = img.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)[np.newaxis]  # HWC→NCHW [1,3,640,640]
+        img = np.ascontiguousarray(img)
+
+        # 拷贝到NPU设备内存
+        acl.rt.memcpy(self.input_buffer, 0, img.ctypes.data,
+                      img.nbytes, acl.memcpy_type.HOST_TO_DEVICE)
+        return img.shape[2:], scale, (pad_x, pad_y)
+
+    def infer_sync(self):
+        """同步推理（阻塞式）"""
+        inputs = [acl.mdl.create_dataset_buffer(self.input_buffer)]
+        outputs = [acl.mdl.create_dataset_buffer(self.output_buffer)]
+
+        # 执行推理
+        acl.mdl.execute(self.model_id, inputs, outputs)
+        acl.rt.synchronize_stream(self.stream)
+
+        # 取回输出数据 [1,6,8400]
+        host_output = np.zeros((1, 6, 8400), dtype=np.float32)
+        acl.rt.memcpy(host_output.ctypes.data, self.output_buffer,
+                      self.output_size, acl.memcpy_type.DEVICE_TO_HOST)
+        return host_output
+
+    def decode_predictions(self, pred, conf_thres=0.5):
+        """高效解码NPU输出"""
+        pred = pred[0]  # [6,8400]
+        # 向量化操作替代循环[3](@ref)
+        cx, cy, w, h, conf, cls_prob = pred[:6]
+
+        # 置信度过滤
+        keep_mask = conf > conf_thres
+        cx, cy, w, h, conf = [arr[keep_mask] for arr in [cx, cy, w, h, conf]]
+        cls_id = (cls_prob[keep_mask] > 0.5).astype(int)
+
+        # 计算边界框
+        x1 = cx - w * 0.5
+        y1 = cy - h * 0.5
+        x2 = cx + w * 0.5
+        y2 = cy + h * 0.5
+
+        boxes = np.column_stack([x1, y1, x2, y2, conf, cls_id])
+        return boxes
+
+    def diou_nms(self, boxes, iou_thres=0.45):
+        """优化版DIoU-NMS"""
+        if len(boxes) == 0:
+            return []
+
+        # 按置信度排序
+        idxs = np.argsort(boxes[:, 4])[::-1]
+        boxes = boxes[idxs]
+
+        keep = []
+        while len(boxes) > 0:
+            keep.append(boxes[0])
+            if len(boxes) == 1:
+                break
+
+            # 计算DIoU
+            ious = np.array([self.calculate_diou(boxes[0], box) for box in boxes[1:]])
+
+            # 保留IoU低于阈值的框
+            mask = ious < iou_thres
+            boxes = boxes[1:][mask]
+
+        return np.array(keep)
+
+    def calculate_diou(self, box1, box2):
+        """向量化DIoU计算"""
+        # 交集坐标
+        inter_x1 = max(box1[0], box2[0])
+        inter_y1 = max(box1[1], box2[1])
+        inter_x2 = min(box1[2], box2[2])
+        inter_y2 = min(box1[3], box2[3])
+
+        # 交集面积
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+
+        # 各自面积
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union_area = area1 + area2 - inter_area
+
+        # IoU计算
+        iou = inter_area / (union_area + 1e-7)
+
+        # 中心点距离
+        center_dist = ((box1[0] + box1[2]) / 2 - (box2[0] + box2[2]) / 2) ** 2 + \
+                      ((box1[1] + box1[3]) / 2 - (box2[1] + box2[3]) / 2) ** 2
+
+        # 最小闭包区域对角线
+        diag_len = (max(box1[2], box2[2]) - min(box1[0], box2[0])) ** 2 + \
+                   (max(box1[3], box2[3]) - min(box1[1], box2[1])) ** 2
+
+        return iou - (center_dist / (diag_len + 1e-7))
+
+    def transform_boxes(self, boxes, orig_shape, scale, padding):
+        """坐标逆变换：640x640 → 原图尺寸"""
+        h_orig, w_orig = orig_shape[:2]
+        pad_x, pad_y = padding
+
+        boxes[:, 0] = (boxes[:, 0] - pad_x) / scale
+        boxes[:, 1] = (boxes[:, 1] - pad_y) / scale
+        boxes[:, 2] = (boxes[:, 2] - pad_x) / scale
+        boxes[:, 3] = (boxes[:, 3] - pad_y) / scale
+
+        # 裁剪到图像边界内
+        boxes[:, 0] = np.clip(boxes[:, 0], 0, w_orig)
+        boxes[:, 1] = np.clip(boxes[:, 1], 0, h_orig)
+        boxes[:, 2] = np.clip(boxes[:, 2], 0, w_orig)
+        boxes[:, 3] = np.clip(boxes[:, 3], 0, h_orig)
+
+        return boxes
+
+    def release(self):
+        """释放NPU资源"""
+        acl.rt.free(self.input_buffer)
+        acl.rt.free(self.output_buffer)
+        acl.mdl.unload(self.model_id)
+        acl.rt.destroy_stream(self.stream)
+        acl.rt.reset_device(self.device_id)
+        acl.finalize()
 
 
-def postprocess(outputs, orig_shape, input_size=(640, 640)):
-    """后处理逻辑重构 - 适配模型输出[1,6,8400]格式"""
-    orig_h, orig_w = orig_shape[:2]
-    model_w, model_h = input_size
+# ================ 视频处理主流程 ================
+class VideoProcessor:
+    def __init__(self, video_path, model_path):
+        # 优化视频解码[6](@ref)
+        self.cap = cv2.VideoCapture()
+        self.cap.open(video_path, apiPreference=cv2.CAP_FFMPEG, params=[
+            cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY
+        ])
 
-    # 处理模型输出 [1,6,8400] -> [8400,6]
-    predictions = np.squeeze(outputs[0])  # 移除batch维度 [6,8400]
-    predictions = predictions.transpose((1, 0))  # 转置为[8400,6]
+        # 创建视频写入器
+        self.writer = self.create_video_writer(video_path, "output.mp4")
 
-    # 分离边界框(4) + 目标置信度(1) + 类别分数(1)
-    boxes = predictions[:, :4].copy()  # [x, y, w, h]
-    obj_conf = predictions[:, 4]  # 目标置信度
-    cls_scores = predictions[:, 5]  # 类别分数（二分类时为单值）
+        # 初始化YOLOv11 NPU引擎
+        self.infer_engine = YOLOv11_NPU(model_path)
 
-    # 计算最终类别置信度 = 目标置信度 * 类别分数
-    confidences = obj_conf * cls_scores
-    # 二分类处理：cls_scores>0.5为dog，否则为cat
-    class_ids = (cls_scores > 0.5).astype(int)
+        # 性能监控
+        self.fps_counter = []
+        self.prev_time = time.time()
 
-    # 转换边界框格式 (cx, cy, w, h) -> (x1, y1, x2, y2)
-    x1 = boxes[:, 0] - boxes[:, 2] / 2
-    y1 = boxes[:, 1] - boxes[:, 3] / 2
-    x2 = boxes[:, 0] + boxes[:, 2] / 2
-    y2 = boxes[:, 1] + boxes[:, 3] / 2
-    boxes = np.column_stack([x1, y1, x2, y2])
+        # 多线程队列
+        self.frame_queue = Queue(maxsize=5)
+        self.result_queue = Queue(maxsize=5)
 
-    # 缩放回原始图像尺寸
-    scale_x = orig_w / model_w
-    scale_y = orig_h / model_h
-    boxes[:, [0, 2]] *= scale_x
-    boxes[:, [1, 3]] *= scale_y
+        # 启动处理线程
+        Thread(target=self.process_frames, daemon=True).start()
 
-    # ============== 关键修改：统一处理NMS返回值 ==============
-    indices = cv2.dnn.NMSBoxes(
-        bboxes=boxes.tolist(),
-        scores=confidences.tolist(),
-        score_threshold=CONF_THRESH,
-        nms_threshold=NMS_THRESH
-    )
+    def create_video_writer(self, input_path, output_path):
+        """创建视频写入器"""
+        frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(self.cap.get(cv2.CAP_PROP_FPS))
 
-    # 处理不同格式的返回值（元组/数组）
-    if indices is not None:
-        indices_np = np.array(indices)
-        if indices_np.ndim == 2:  # 处理二维数组
-            indices_np = indices_np[:, 0]
-        indices_flat = indices_np.flatten().astype(int)
-    else:
-        indices_flat = np.array([], dtype=int)
-    # ============== 修改结束 ==============
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        return cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    detections = []
-    for idx in indices_flat:
-        class_id = class_ids[idx]
-        confidence = confidences[idx]
-        x1, y1, x2, y2 = boxes[idx]
+    def process_frames(self):
+        """帧处理线程"""
+        while True:
+            if self.frame_queue.empty():
+                time.sleep(0.01)
+                continue
 
-        x1 = max(0, min(orig_w - 1, x1))
-        y1 = max(0, min(orig_h - 1, y1))
-        x2 = max(0, min(orig_w - 1, x2))
-        y2 = max(0, min(orig_h - 1, y2))
+            frame = self.frame_queue.get()
+            if frame is None:
+                break
 
-        detections.append({
-            "class": CLASS_NAMES[class_id],
-            "confidence": float(confidence),
-            "box": [int(x1), int(y1), int(x2), int(y2)]
-        })
+            # 记录原始尺寸
+            orig_shape = frame.shape
 
-    return detections
+            # 预处理 & 获取缩放参数
+            _, scale, padding = self.infer_engine.preprocess(frame)
 
-def rotate_crop_frame(frame):
-    """旋转裁剪为640x640 - 保持原逻辑"""
-    rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    h, w = rotated.shape[:2]
-    start_x = (w - 640) // 2
-    start_y = (h - 640) // 2
-    return rotated[start_y:start_y + 640, start_x:start_x + 640]
+            # NPU推理
+            output = self.infer_engine.infer_sync()
 
+            # 后处理
+            boxes = self.infer_engine.decode_predictions(output, conf_thres=0.5)
+            if len(boxes) > 0:
+                boxes = self.infer_engine.diou_nms(boxes)
+                boxes = self.infer_engine.transform_boxes(boxes, orig_shape, scale, padding)
 
-def main():
-    # 初始化模型
-    session = InferSession(device_id=0, model_path=MODEL_PATH)
+            # 可视化
+            for box in boxes:
+                x1, y1, x2, y2, conf, cls_id = box
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(frame, f"{cls_id}:{conf:.2f}", (int(x1), int(y1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    # 打开摄像头
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        print("错误: 无法打开USB摄像头")
-        return
+            # 性能监控
+            curr_time = time.time()
+            fps = 1 / (curr_time - self.prev_time)
+            self.fps_counter.append(fps)
+            self.prev_time = curr_time
+            cv2.putText(frame, f"FPS: {int(np.mean(self.fps_counter[-10:]))}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    print(f"摄像头分辨率: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
+            self.result_queue.put(frame)
 
-    # 注册信号处理器
-    def signal_handler(sig, frame):
-        print("\n释放资源中...")
-        cap.release()
-        cv2.destroyAllWindows()
-        sys.exit(0)
+    def run(self):
+        """主处理循环"""
+        # 智能跳帧策略[6](@ref)
+        target_fps = 30
+        current_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        skip_ratio = max(1, int(current_fps / target_fps))
 
-    signal.signal(signal.SIGTSTP, signal_handler)
+        frame_count = 0
+        while True:
+            # 跳帧处理
+            for _ in range(skip_ratio - 1):
+                self.cap.grab()
+                frame_count += 1
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+            ret, frame = self.cap.retrieve()
+            if not ret:
+                break
 
-        # 旋转裁剪为640x640
-        # processed_frame = rotate_crop_frame(frame)
-        processed_frame = frame
-        print("输入尺寸:", processed_frame.shape)
-        orig_h, orig_w = frame.shape[:2]
+            frame_count += 1
+            print(f"处理帧: {frame_count}")
 
-        # 预处理
-        blob = preprocess(processed_frame)
+            # 添加到处理队列
+            self.frame_queue.put(frame)
 
-        # 推理
-        outputs = session.infer([blob])
+            # 获取处理结果
+            if not self.result_queue.empty():
+                result_frame = self.result_queue.get()
+                cv2.imshow('YOLOv11M NPU', result_frame)
+                self.writer.write(result_frame)
 
-        # 后处理
-        detections = postprocess(outputs, (orig_h, orig_w))
-
-        # 打印检测结果
-        print(f"\n检测到 {len(detections)} 个目标:")
-        for i, det in enumerate(detections):
-            print(f"  目标 {i + 1}: {det['class']} | "
-                  f"置信度: {det['confidence']:.4f} | "
-                  f"位置: [{det['box'][0]}, {det['box'][1]}, {det['box'][2]}, {det['box'][3]}]")
-
-        # 绘制检测结果
-        for det in detections:
-            x1, y1, x2, y2 = det['box']
-            cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(processed_frame,
-                        f"{det['class']}: {det['confidence']:.2f}",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        # 显示结果
-        if SHOW_WINDOW:
-            cv2.imshow('Detection', processed_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-    # 清理资源
-    cap.release()
-    cv2.destroyAllWindows()
+        # 清理资源
+        self.frame_queue.put(None)
+        self.cap.release()
+        self.writer.release()
+        self.infer_engine.release()
+        cv2.destroyAllWindows()
 
 
-if __name__ == '__main__':
-    main()
+# ================ 执行视频处理 ================
+if __name__ == "__main__":
+    video_path = "./datasets/video/cat_blibli_7.mp4"  # 替换为你的视频路径
+    model_path = "./runs/train/train/weights/best.om"  # NPU模型路径
+
+    processor = VideoProcessor(video_path, model_path)
+    processor.run()
