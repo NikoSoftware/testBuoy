@@ -185,7 +185,7 @@ class VideoProcessor:
         ])
 
         # 创建视频写入器
-        self.writer = self.create_video_writer(video_path, "output.mp4")
+        self.writer = self.create_video_writer(video_path, "./img/output.mp4")
 
         # 初始化YOLOv11 NPU引擎
         self.infer_engine = YOLOv11_NPU(model_path)
