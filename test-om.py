@@ -8,10 +8,10 @@ import os
 
 # ====================== FP16优化配置 ======================
 MODEL_PATH = "./runs/train/train/weights/best.om"
-VIDEO_PATH = "./datasets/test/30386095338-1-192.mp4"
+VIDEO_PATH = "./datasets/video/dog.mp4"
 CLASS_NAMES = ["cat", "dog"]  # 类别名称
-CONF_THRESH = 0.55  # 降低置信度阈值提高召回率
-NMS_THRESH = 0.6  # 调整NMS阈值平衡精度与召回
+CONF_THRESH = 0.2  # 降低置信度阈值提高召回率
+NMS_THRESH = 0.2  # 调整NMS阈值平衡精度与召回
 INPUT_SIZE = (640, 640)
 SHOW_WINDOW = False
 CALIBRATION_ENABLED = False  # 启用量化校准模式
