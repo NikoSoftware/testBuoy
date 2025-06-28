@@ -170,7 +170,7 @@ def main():
 def rotate_crop_frame(frame):
     # """旋转裁剪为640x640 - 保持原逻辑"""
     # rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    h, w = rotated.shape[:2]
+    h, w = frame.shape[:2]
     start_x = (w - 640) // 2
     start_y = (h - 640) // 2
     return frame[start_y:start_y + 640, start_x:start_x + 640]
