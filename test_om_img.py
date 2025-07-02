@@ -128,6 +128,9 @@ def main():
 
     print(f"推理后的内容：{json.dumps(outputs[0].tolist(), indent=4)}")
 
+    with open('./data.json', 'w', encoding='utf-8') as f:
+        json.dump(outputs[0].tolist(), indent=4)
+
     inference_time = time.time() - inference_start
 
     # 3. 后处理
