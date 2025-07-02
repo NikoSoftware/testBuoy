@@ -126,7 +126,7 @@ def main():
     inference_start = time.time()
     outputs = session.infer([blob])
 
-    print(f"推理后的内容：{json.dump(outputs)}")
+    print(f"推理后的内容：{json.dumps(outputs)}")
 
     inference_time = time.time() - inference_start
 
