@@ -1,3 +1,6 @@
+import json
+from json.decoder import JSONObject
+
 import cv2
 import numpy as np
 from ais_bench.infer.interface import InferSession
@@ -122,6 +125,9 @@ def main():
     # 2. 推理
     inference_start = time.time()
     outputs = session.infer([blob])
+
+    print(f"推理后的内容：{json.dump(outputs)}")
+
     inference_time = time.time() - inference_start
 
     # 3. 后处理
