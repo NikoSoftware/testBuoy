@@ -126,7 +126,6 @@ def main():
     inference_start = time.time()
     outputs = session.infer([blob])
 
-    print(f"推理后的内容：{json.dumps(outputs[0].tolist(), indent=4)}")
 
     with open('./data.json', 'w', encoding='utf-8') as f:
         json.dump(outputs[0].tolist(), f, indent=4, ensure_ascii=False )
